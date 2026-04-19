@@ -1,4 +1,4 @@
-name: Build EchoMusic Desktop
+name: Build EchoMusic Win Desktop
 
 on:
   push:
