@@ -1,0 +1,75 @@
+name: Build EchoMusic Desktop
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build for Windows
+    timeout-minutes: 90
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install server runtime dependencies
+        working-directory: server
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --omit=dev --no-audit --no-fund
+          else
+            npm install --omit=dev --no-audit --no-fund
+          fi
+
+      - name: Remove server test files
+        working-directory: server
+        shell: bash
+        run: find module -name '*.test.js' -delete
+
+      - name: Build desktop app (Windows)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+        run: |
+          pnpm exec vue-tsc --noEmit && pnpm exec vite build
+          pnpm exec electron-builder --win --x64 --publish never
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoMusic-Windows
+          path: |
+            release/EchoMusic-*-Windows-Setup-*.exe
+            release/latest.yml
+          if-no-files-found: error
+          retention-days: 7
