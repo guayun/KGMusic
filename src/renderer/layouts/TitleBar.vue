@@ -12,6 +12,8 @@ import {
   iconSquare,
   iconX,
   iconSearch,
+  iconMicrophone,
+  iconFullscreen,
 } from '@/icons';
 
 const route = useRoute();
@@ -43,7 +45,7 @@ const updateNavState = () => {
   canGoForward.value = !skipCurrent && !!historyState?.forward;
 };
 
-const handleControl = (action: 'minimize' | 'maximize' | 'close') => {
+const handleControl = (action: 'minimize' | 'maximize' | 'close' | 'fullscreen') => {
   window.electron.windowControl(action);
 };
 
@@ -54,6 +56,8 @@ const goForward = () => {
   if (canGoForward.value) router.forward();
 };
 const refresh = async () => {
+  // 清空 API 缓存，确保刷新后拿到最新数据
+  await window.electron.api.clearCache();
   await router.replace({
     path: route.path,
     query: { ...route.query, _t: Date.now().toString() },
@@ -180,7 +184,7 @@ onUnmounted(() => {
     ref="titleBarRef"
     class="title-bar flex items-center shrink-0 select-none transition-colors duration-300 z-200 bg-transparent relative"
   >
-    <!-- 拖动层：VS Code 方案，绝对定位铺满标题栏 -->
+    <!-- 拖动层：绝对定位铺满标题栏 -->
     <div class="drag-region"></div>
 
     <!-- 1. 左侧：导航按钮 -->
@@ -223,9 +227,26 @@ onUnmounted(() => {
       </Button>
       <Button variant="unstyled" size="none" @click="refresh" class="nav-btn group" title="刷新">
         <RefreshIcon
+          width="22"
+          height="22"
+          class="text-text-main opacity-60 group-hover:opacity-100 transition-opacity"
+        />
+      </Button>
+
+      <!-- 听歌识曲 -->
+      <Button
+        variant="unstyled"
+        size="none"
+        class="nav-btn group"
+        title="听歌识曲"
+        @click="router.push({ name: 'recognize' })"
+      >
+        <Icon
+          :icon="iconMicrophone"
           width="18"
           height="18"
-          class="text-text-main opacity-60 group-hover:opacity-100 transition-opacity"
+          style="stroke-width: 3"
+          class="text-text-main opacity-60 group-hover:opacity-100 transition-opacity tb-icon-bold"
         />
       </Button>
 
@@ -236,12 +257,17 @@ onUnmounted(() => {
           v-if="!isSearchExpanded"
           variant="unstyled"
           size="none"
-          class="tb-search-trigger"
+          class="nav-btn group"
           title="搜索"
           @click="expandSearch"
         >
-          <Icon :icon="iconSearch" width="16" height="16" />
-          <span class="tb-search-trigger-text">搜索</span>
+          <Icon
+            :icon="iconSearch"
+            width="18"
+            height="18"
+            style="stroke-width: 3"
+            class="text-text-main opacity-60 group-hover:opacity-100 transition-opacity tb-icon-bold"
+          />
         </Button>
 
         <!-- 展开状态：搜索输入框 -->
@@ -274,6 +300,19 @@ onUnmounted(() => {
               "
             >
               <Icon :icon="iconX" width="14" height="14" />
+            </Button>
+            <Button
+              v-else
+              variant="unstyled"
+              size="none"
+              class="tb-search-goto"
+              @mousedown.prevent
+              @click="
+                collapseSearch();
+                router.push({ name: 'search' });
+              "
+            >
+              搜索页
             </Button>
           </div>
 
@@ -309,6 +348,15 @@ onUnmounted(() => {
       <Button variant="unstyled" size="none" @click="handleControl('minimize')" class="control-btn">
         <Icon :icon="iconMinus" width="14" height="14" />
       </Button>
+      <Button
+        variant="unstyled"
+        size="none"
+        @click="handleControl('fullscreen')"
+        class="control-btn"
+        title="全屏"
+      >
+        <Icon :icon="iconFullscreen" width="14" height="14" />
+      </Button>
       <Button variant="unstyled" size="none" @click="handleControl('maximize')" class="control-btn">
         <Icon :icon="iconSquare" width="13" height="13" />
       </Button>
@@ -335,7 +383,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 6px;
+  border-radius: 50%;
   transition: all 0.2s;
   background: transparent;
   border: none;
@@ -356,6 +404,14 @@ onUnmounted(() => {
 
 .nav-btn:disabled:hover {
   background-color: transparent;
+}
+
+/* 加粗图标（穿透到 SVG 内部） */
+.tb-icon-bold :deep(path),
+.tb-icon-bold :deep(line),
+.tb-icon-bold :deep(circle),
+.tb-icon-bold :deep(polyline) {
+  stroke-width: 2.5 !important;
 }
 
 .control-btn {
@@ -387,37 +443,6 @@ onUnmounted(() => {
   position: relative;
 }
 
-.tb-search-trigger {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 12px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.05);
-  color: var(--color-text-secondary);
-  font-size: 12px;
-  font-weight: 500;
-  transition: all 0.2s ease;
-}
-
-.dark .tb-search-trigger {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.tb-search-trigger:hover {
-  background: rgba(0, 0, 0, 0.08);
-  color: var(--color-text-main);
-}
-
-.dark .tb-search-trigger:hover {
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.tb-search-trigger-text {
-  line-height: 1;
-}
-
 .tb-search-expanded {
   position: relative;
   width: 320px;
@@ -438,7 +463,7 @@ onUnmounted(() => {
 .tb-search-input-wrap {
   display: flex;
   align-items: center;
-  height: 34px;
+  height: 30px;
   border-radius: 999px;
   background: rgba(0, 0, 0, 0.06);
   padding: 0 4px 0 10px;
@@ -498,6 +523,30 @@ onUnmounted(() => {
 
 .dark .tb-search-clear:hover {
   background: rgba(255, 255, 255, 0.1);
+}
+
+.tb-search-goto {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-primary);
+  background: rgba(0, 113, 227, 0.08);
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.tb-search-goto:hover {
+  background: rgba(0, 113, 227, 0.14);
+}
+
+.dark .tb-search-goto {
+  background: rgba(0, 113, 227, 0.12);
+}
+
+.dark .tb-search-goto:hover {
+  background: rgba(0, 113, 227, 0.2);
 }
 
 /* 搜索建议下拉 */

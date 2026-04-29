@@ -10,6 +10,7 @@ import {
   type MediaSessionMeta,
   type MediaSessionState,
   type PlayerEngineEvents,
+  type TrackLoudness,
 } from '@/utils/player';
 import { getCoverUrl } from '@/utils/cover';
 import type { Song, SongRelateGood } from '@/models/song';
@@ -36,7 +37,8 @@ const normalizeEffect = (value: string | undefined): AudioEffectValue => {
   const options: AudioEffectValue[] = [
     'none',
     'piano',
-    'acappella',
+    'vocal',
+    'accompaniment',
     'subwoofer',
     'ancient',
     'surnay',
@@ -90,22 +92,35 @@ const resolveUrlFromResponse = (payload: unknown): string => {
   return '';
 };
 
-const buildAudioOutputDeviceSignature = (devices: MediaDeviceInfo[]): string | null => {
-  const outputs = devices
-    .filter((device) => device.kind === 'audiooutput')
-    .map((device) => ({
-      deviceId: device.deviceId || 'default',
-      groupId: device.groupId || '',
-      label: device.label || '',
-    }))
-    .sort((left, right) => {
-      const leftKey = `${left.deviceId}|${left.groupId}|${left.label}`;
-      const rightKey = `${right.deviceId}|${right.groupId}|${right.label}`;
-      return leftKey.localeCompare(rightKey);
-    });
-
-  if (outputs.length === 0) return null;
-  return outputs.map((device) => `${device.deviceId}|${device.groupId}|${device.label}`).join('::');
+/** 从 API 响应中提取曲目响度信息 */
+const resolveTrackLoudness = (payload: unknown): TrackLoudness | null => {
+  if (!payload || typeof payload !== 'object') return null;
+  const record = payload as Record<string, unknown>;
+  // 响度字段可能在顶层或 data 层
+  const source =
+    typeof record.volume === 'number'
+      ? record
+      : typeof record.data === 'object' && record.data !== null
+        ? (record.data as Record<string, unknown>)
+        : null;
+  if (!source || typeof source.volume !== 'number') return null;
+  const lufs = source.volume as number;
+  const gain =
+    typeof source.volume_gain === 'number'
+      ? (source.volume_gain as number)
+      : typeof source.volumeGain === 'number'
+        ? (source.volumeGain as number)
+        : 0;
+  const peak =
+    typeof source.volume_peak === 'number'
+      ? (source.volume_peak as number)
+      : typeof source.volumePeak === 'number'
+        ? (source.volumePeak as number)
+        : 0;
+  if (!Number.isFinite(lufs)) return null;
+  // volume=0 且 volume_gain=0 表示服务端没有响度数据
+  if (lufs === 0 && gain === 0) return null;
+  return { lufs, gain, peak: Math.max(0, peak) };
 };
 
 const findTrackById = (
@@ -174,6 +189,7 @@ type ResolvedAudioSource = {
   url: string;
   quality: AudioQualityValue | null;
   effect: AudioEffectValue;
+  loudness: TrackLoudness | null;
 };
 
 type ClimaxMark = { start: number; end: number };
@@ -303,6 +319,7 @@ const resolvePlaybackNotice = (params: {
 export const usePlayerStore = defineStore('player', {
   state: () => ({
     isPlaying: false,
+    isLyricViewOpen: false,
     volume: 0.8,
     currentTime: 0,
     duration: 0,
@@ -323,9 +340,9 @@ export const usePlayerStore = defineStore('player', {
     pendingSettingRefresh: false,
     climaxMarks: [] as ClimaxMark[],
     outputDeviceWatcherRegistered: false,
-    lastAudioOutputDeviceSignature: null as string | null,
     outputDeviceRefreshTimer: null as number | null,
     appliedOutputDeviceId: 'default' as string,
+    _lastAppliedExclusive: false,
     currentAudioQualityOverride: null as AudioQualityValue | null,
     playbackRequestSeq: 0,
     climaxRequestSeq: 0,
@@ -343,8 +360,12 @@ export const usePlayerStore = defineStore('player', {
     shufflePlayed: new Set<number>(),
     seekTargetTime: null as number | null,
     seekTimestamp: 0,
+    isResuming: false,
   }),
   actions: {
+    toggleLyricView(open?: boolean) {
+      this.isLyricViewOpen = open ?? !this.isLyricViewOpen;
+    },
     showPlaybackNotice(code: string, track?: Song | null) {
       const settingStore = useSettingStore();
       this.playbackNotice = resolvePlaybackNotice({
@@ -603,7 +624,6 @@ export const usePlayerStore = defineStore('player', {
     },
 
     init() {
-      const lyricStore = useLyricStore();
       const settingStore = useSettingStore();
       logger.info('PlayerStore', 'Initializing player store', {
         volume: this.volume,
@@ -613,9 +633,21 @@ export const usePlayerStore = defineStore('player', {
       // 恢复持久化的音量与倍速
       engine.setVolume(this.volume);
       engine.setPlaybackRate(this.playbackRate);
+      // 恢复音量均衡设置
+      engine.setVolumeNormalization(settingStore.volumeNormalization);
+      engine.setReferenceLufs(settingStore.volumeNormalizationLufs);
+      // 同步文件循环模式
+      engine.setLoopFile(this.playMode === 'single');
       this.registerSettingWatchers(settingStore);
       this.registerOutputDeviceWatcher(settingStore);
       void this.refreshOutputDevices(settingStore);
+
+      // 节流：MediaSession 位置状态每 2 秒同步一次即可
+      let lastMediaSessionSync = 0;
+      const MEDIA_SESSION_SYNC_MS = 2000;
+      // 节流：播放历史上报每 5 秒检查一次
+      let lastHistoryCheck = 0;
+      const HISTORY_CHECK_MS = 5000;
 
       const events: PlayerEngineEvents = {
         timeUpdate: (currentTime) => {
@@ -630,18 +662,26 @@ export const usePlayerStore = defineStore('player', {
           }
           this.seekTargetTime = null;
           this.currentTime = currentTime;
-          lyricStore.updateCurrentIndex(currentTime);
-          this.maybeCommitListeningHistory();
-          engine.updateMediaPlaybackState(
-            buildMediaState({
-              isPlaying: this.isPlaying,
-              duration: this.duration,
-              currentTime,
-              playbackRate: this.playbackRate,
-            }),
-          );
+
+          const now = Date.now();
+          if (now - lastHistoryCheck >= HISTORY_CHECK_MS) {
+            lastHistoryCheck = now;
+            this.maybeCommitListeningHistory();
+          }
+          if (now - lastMediaSessionSync >= MEDIA_SESSION_SYNC_MS) {
+            lastMediaSessionSync = now;
+            engine.updateMediaPlaybackState(
+              buildMediaState({
+                isPlaying: this.isPlaying,
+                duration: this.duration,
+                currentTime,
+                playbackRate: this.playbackRate,
+              }),
+            );
+          }
         },
         durationChange: (duration) => {
+          // 始终使用 mpv 报告的实际时长，这是真实可播放范围
           this.duration = duration;
           engine.updateMediaPlaybackState(
             buildMediaState({
@@ -651,6 +691,15 @@ export const usePlayerStore = defineStore('player', {
               playbackRate: this.playbackRate,
             }),
           );
+          // 检测实际时长与歌曲元数据时长的差异，差异过大时提示歌词可能不同步
+          const lyricStore = useLyricStore();
+          const trackDuration = this.currentTrackSnapshot?.duration ?? 0;
+          if (duration > 0 && trackDuration > 0) {
+            const diff = Math.abs(duration - trackDuration);
+            lyricStore.lyricSyncWarning = diff > 10 && diff / trackDuration > 0.1;
+          } else {
+            lyricStore.lyricSyncWarning = false;
+          }
         },
         ended: () => {
           if (this.recentSeekIgnoreEnd) {
@@ -725,13 +774,33 @@ export const usePlayerStore = defineStore('player', {
 
       engine.setEvents(events);
       engine.setMediaSessionHandlers({
-        play: () => this.togglePlay(),
-        pause: () => this.togglePlay(),
+        play: () => {
+          if (!this.isPlaying) this.togglePlay();
+        },
+        pause: () => {
+          if (this.isPlaying) this.togglePlay();
+        },
         previoustrack: () => this.prev(),
         nexttrack: () => this.next(),
         seekto: (time) => this.seek(time),
         seekbackward: (offset) => this.seek(Math.max(0, this.currentTime - offset)),
         seekforward: (offset) => this.seek(Math.min(this.duration, this.currentTime + offset)),
+      });
+
+      // 渲染进程重新加载后，从 mpv 同步当前播放状态
+      window.electron?.mpv?.getState?.().then((state) => {
+        if (!state) return;
+        if (state.playing && !this.isPlaying) {
+          this.isPlaying = true;
+          this.isLoading = false;
+          settingStore.syncPreventSleep(true);
+        }
+        if (state.duration > 0) {
+          this.duration = state.duration;
+        }
+        if (state.timePos > 0) {
+          this.currentTime = state.timePos;
+        }
       });
     },
 
@@ -745,6 +814,7 @@ export const usePlayerStore = defineStore('player', {
         volumeFade: settingStore.volumeFade,
         volumeFadeTime: settingStore.volumeFadeTime,
         outputDevice: settingStore.outputDevice,
+        exclusiveAudioDevice: settingStore.exclusiveAudioDevice,
       };
 
       settingStore.$subscribe((_mutation, state) => {
@@ -756,7 +826,9 @@ export const usePlayerStore = defineStore('player', {
         const shouldUpdateFade =
           state.volumeFade !== snapshot.volumeFade ||
           state.volumeFadeTime !== snapshot.volumeFadeTime;
-        const shouldUpdateOutputDevice = state.outputDevice !== snapshot.outputDevice;
+        const shouldUpdateOutputDevice =
+          state.outputDevice !== snapshot.outputDevice ||
+          state.exclusiveAudioDevice !== snapshot.exclusiveAudioDevice;
 
         snapshot = {
           defaultAudioQuality: state.defaultAudioQuality,
@@ -764,6 +836,7 @@ export const usePlayerStore = defineStore('player', {
           volumeFade: state.volumeFade,
           volumeFadeTime: state.volumeFadeTime,
           outputDevice: state.outputDevice,
+          exclusiveAudioDevice: state.exclusiveAudioDevice,
         };
 
         if (shouldRefresh) {
@@ -789,7 +862,14 @@ export const usePlayerStore = defineStore('player', {
         currentTrackId: this.currentTrackId,
         isPlaying: this.isPlaying,
         hasSource: !!engine.source,
+        isResuming: this.isResuming,
       });
+
+      if (this.isResuming) {
+        logger.debug('PlayerStore', 'Ignoring toggle: already resuming');
+        return;
+      }
+
       if (!this.currentTrackId) {
         const playlist = usePlaylistStore();
         if ((playlist.activeQueue?.songs.length ?? playlist.defaultList.length) > 0) {
@@ -804,7 +884,24 @@ export const usePlayerStore = defineStore('player', {
       }
 
       if (this.isPlaying) {
-        await engine.pause();
+        // 乐观更新：立即切换 UI 状态，不等待 IPC 往返
+        // mpv 的 state-change 事件会做最终确认（幂等赋值 isPlaying = false）
+        // pause 命令几乎不可能失败（唯一场景是 mpv 崩溃，此时音乐本身也停了）
+        this.isPlaying = false;
+        const settingStore = useSettingStore();
+        settingStore.syncPreventSleep(false);
+        engine.updateMediaPlaybackState(
+          buildMediaState({
+            isPlaying: false,
+            duration: this.duration,
+            currentTime: this.currentTime,
+            playbackRate: this.playbackRate,
+          }),
+        );
+
+        engine.pause().catch((err) => {
+          logger.error('PlayerStore', 'Pause command failed', err);
+        });
         return;
       }
 
@@ -816,10 +913,34 @@ export const usePlayerStore = defineStore('player', {
         return;
       }
 
+      this.isResuming = true;
+      this.isPlaying = true;
+      const settingStore = useSettingStore();
+      settingStore.syncPreventSleep(true);
+      engine.updateMediaPlaybackState(
+        buildMediaState({
+          isPlaying: true,
+          duration: this.duration,
+          currentTime: this.currentTime,
+          playbackRate: this.playbackRate,
+        }),
+      );
+
       try {
-        await engine.play();
+        const timeoutMs = (settingStore.playResumeTimeout ?? 5) * 1000;
+        await engine.play({ timeoutMs: timeoutMs > 0 ? timeoutMs : undefined });
       } catch (error) {
-        logger.error('PlayerStore', 'Playback failed:', error);
+        logger.error('PlayerStore', 'Playback resume failed, replaying current track', error);
+        // play 失败，回滚状态并尝试重新加载
+        this.isPlaying = false;
+        settingStore.syncPreventSleep(false);
+        try {
+          await this.playTrack(this.currentTrackId);
+        } catch {
+          // playTrack 也失败则放弃
+        }
+      } finally {
+        this.isResuming = false;
       }
     },
 
@@ -859,12 +980,15 @@ export const usePlayerStore = defineStore('player', {
     },
 
     seek(time: number) {
-      const targetTime = Math.max(0, Math.min(this.duration, time));
+      // 用 mpv 报告的实际时长做 clamp，比 store 的 duration（可能来自元数据）更准确
+      const effectiveDuration = engine.duration > 0 ? engine.duration : this.duration;
+      const targetTime = Math.max(0, Math.min(effectiveDuration, time));
       logger.info('PlayerStore', 'Seek requested', {
         currentTrackId: this.currentTrackId,
         from: this.currentTime,
         to: targetTime,
         duration: this.duration,
+        engineDuration: engine.duration,
       });
       if (this.isDraggingProgress) {
         this.isDraggingProgress = false;
@@ -877,7 +1001,6 @@ export const usePlayerStore = defineStore('player', {
       window.setTimeout(() => {
         this.recentSeekIgnoreEnd = false;
       }, 800);
-      useLyricStore().updateCurrentIndex(targetTime);
       engine.updateMediaPlaybackState(
         buildMediaState({
           isPlaying: this.isPlaying,
@@ -894,6 +1017,8 @@ export const usePlayerStore = defineStore('player', {
       this.shuffleQueue = null;
       this.shuffleQueueLength = 0;
       this.shufflePlayed = new Set();
+      // 同步 mpv 文件循环：单曲循环由 mpv 内部处理，不依赖 end-file 事件
+      engine.setLoopFile(mode === 'single');
       logger.info('PlayerStore', 'Play mode updated', {
         mode,
       });
@@ -905,6 +1030,16 @@ export const usePlayerStore = defineStore('player', {
           playbackRate: this.playbackRate,
         }),
       );
+    },
+
+    setVolumeNormalization(enabled: boolean) {
+      engine.setVolumeNormalization(enabled);
+      logger.info('PlayerStore', 'Volume normalization updated', { enabled });
+    },
+
+    setReferenceLufs(lufs: number) {
+      engine.setReferenceLufs(lufs);
+      logger.info('PlayerStore', 'Reference LUFS updated', { lufs });
     },
 
     async playTrack(
@@ -1022,7 +1157,12 @@ export const usePlayerStore = defineStore('player', {
       }
 
       const pendingMediaMeta = buildMediaMeta(track);
-      if (pendingMediaMeta) engine.updateMediaMetadata(pendingMediaMeta);
+      if (pendingMediaMeta) {
+        engine.updateMediaMetadata({
+          ...pendingMediaMeta,
+          durationMs: (track.duration || 0) * 1000,
+        });
+      }
       engine.updateMediaPlaybackState(
         buildStoppedPlaybackState({
           playbackRate: this.playbackRate,
@@ -1075,6 +1215,9 @@ export const usePlayerStore = defineStore('player', {
         resolvedEffect: resolved.effect,
       });
       engine.setSource(resolved.url);
+      engine.applyTrackLoudness(resolved.loudness);
+      // 同步文件循环模式
+      engine.setLoopFile(this.playMode === 'single');
 
       try {
         if (autoPlay) {
@@ -1103,6 +1246,10 @@ export const usePlayerStore = defineStore('player', {
         this.autoNextAttempts = 0;
         this.autoNextSourceTrackId = String(track.id);
         this.clearAutoNextTimer();
+        // mpv 未推送 duration 时用 track 元数据兜底（流式音频场景）
+        if (!this.duration && !engine.duration && track.duration) {
+          this.duration = track.duration;
+        }
         // 非淡入模式才直接设音量（淡入时由 engine 内部处理）
         if (!autoPlay || !settingStore.volumeFade) {
           engine.setVolume(this.volume);
@@ -1114,6 +1261,10 @@ export const usePlayerStore = defineStore('player', {
               playbackRate: this.playbackRate,
             }),
           );
+        } else if (!this.isPlaying) {
+          // mpv 的 state-change 事件可能因 IPC 延迟未到达，强制同步状态
+          this.isPlaying = true;
+          settingStore.syncPreventSleep(true);
         }
         void this.fetchClimaxMarks(track);
         if (this.pendingSettingRefresh) {
@@ -1465,55 +1616,47 @@ export const usePlayerStore = defineStore('player', {
     async refreshOutputDevices(settingStore: ReturnType<typeof useSettingStore>) {
       const fallbackOptions = [{ label: '系统默认', value: 'default' }];
 
-      logger.info('PlayerStore', 'Refreshing output devices', {
-        currentOutputDevice: settingStore.outputDevice,
-        hasEnumerateDevices: typeof navigator.mediaDevices?.enumerateDevices === 'function',
-        hasGetUserMedia: typeof navigator.mediaDevices?.getUserMedia === 'function',
-      });
-
-      if (!navigator.mediaDevices?.enumerateDevices) {
-        logger.warn('PlayerStore', 'Output device enumeration unsupported in current environment');
-        settingStore.outputDevices = fallbackOptions;
-        settingStore.outputDeviceType = 'default';
-        settingStore.setOutputDeviceStatus(
-          'unsupported',
-          '当前系统暂不支持在应用内切换输出设备，请使用系统声音设置切换。',
-        );
-        return;
-      }
+      logger.info('PlayerStore', 'Refreshing output devices from mpv');
 
       try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const outputs = devices.filter((device) => device.kind === 'audiooutput');
-        const nextSignature = buildAudioOutputDeviceSignature(devices);
-        const previousSignature = this.lastAudioOutputDeviceSignature;
-        this.lastAudioOutputDeviceSignature = nextSignature;
+        const mpvDevices = await window.electron?.mpv?.getAudioDevices();
+        if (!Array.isArray(mpvDevices) || mpvDevices.length === 0) {
+          logger.warn('PlayerStore', 'mpv returned no audio devices');
+          settingStore.outputDevices = fallbackOptions;
+          settingStore.setOutputDeviceStatus('ready', '当前仅检测到系统默认输出设备。');
+          return;
+        }
 
-        const outputOptions = outputs
-          .filter((device) => device.deviceId && device.deviceId !== 'default')
-          .map((device, index) => ({
-            label: device.label || `输出设备 ${index + 1}`,
-            value: device.deviceId,
-          }));
+        // mpv 设备格式：{ name: "wasapi/{GUID}", description: "扬声器 (Realtek)" }
+        // auto 是 mpv 的默认设备，映射为 default
+        const outputOptions = mpvDevices
+          .filter(
+            (d: { name: string; description: string }) =>
+              d.name && d.name !== 'auto' && d.name !== 'null',
+          )
+          .map((d: { name: string; description: string }) => ({
+            label: d.description || d.name,
+            value: d.name,
+          }))
+          .filter(
+            (
+              item: { label: string; value: string },
+              index: number,
+              arr: { label: string; value: string }[],
+            ) => arr.findIndex((other) => other.label === item.label) === index,
+          );
 
         settingStore.outputDevices = [...fallbackOptions, ...outputOptions];
 
-        logger.info('PlayerStore', 'Output devices enumerated', {
-          totalDevices: devices.length,
-          outputCount: outputs.length,
-          options: outputOptions.map((device) => ({
-            label: device.label,
-            value: device.value,
+        logger.info('PlayerStore', 'mpv audio devices enumerated', {
+          count: outputOptions.length,
+          devices: outputOptions.map((d: { label: string; value: string }) => ({
+            label: d.label,
+            value: d.value,
           })),
         });
 
-        const labelsMissing = outputs.length > 0 && outputs.every((device) => !device.label);
-        if (labelsMissing) {
-          settingStore.setOutputDeviceStatus(
-            'permission',
-            '系统未返回设备名称，可能需要授予媒体设备权限后才能显示完整列表。',
-          );
-        } else if (outputs.length <= 1) {
+        if (outputOptions.length === 0) {
           settingStore.setOutputDeviceStatus('ready', '当前仅检测到系统默认输出设备。');
         } else {
           settingStore.setOutputDeviceStatus('ready', '已检测到可用输出设备。');
@@ -1521,7 +1664,8 @@ export const usePlayerStore = defineStore('player', {
 
         const currentOutput = settingStore.outputDevice;
         const hasCurrentDevice =
-          currentOutput === 'default' || outputOptions.some((item) => item.value === currentOutput);
+          currentOutput === 'default' ||
+          outputOptions.some((item: { value: string }) => item.value === currentOutput);
         const shouldRestorePreferredOutput =
           currentOutput !== 'default' &&
           hasCurrentDevice &&
@@ -1535,8 +1679,6 @@ export const usePlayerStore = defineStore('player', {
             currentOutput,
             shouldPause,
             disconnectBehavior,
-            previousSignature,
-            nextSignature,
           });
 
           if (disconnectBehavior === 'fallback') {
@@ -1569,68 +1711,14 @@ export const usePlayerStore = defineStore('player', {
       } catch (error) {
         logger.warn('PlayerStore', 'Refresh output devices failed:', error);
         settingStore.outputDevices = fallbackOptions;
-        settingStore.outputDeviceType = 'default';
-        const errorName = error instanceof DOMException ? error.name : '';
-        if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
-          settingStore.setOutputDeviceStatus(
-            'permission',
-            '尚未获得音频设备权限，请先授权后再获取完整设备列表。',
-          );
-        } else {
-          settingStore.setOutputDeviceStatus(
-            'error',
-            '获取输出设备失败，请检查系统音频权限或稍后重试。',
-          );
-        }
+        settingStore.setOutputDeviceStatus('error', '获取输出设备失败，请稍后重试。');
       }
     },
 
     async requestOutputDevicePermission(settingStore = useSettingStore()) {
-      logger.info('PlayerStore', 'Requesting output device permission', {
-        currentOutputDevice: settingStore.outputDevice,
-        hasGetUserMedia: typeof navigator.mediaDevices?.getUserMedia === 'function',
-      });
-
-      if (!navigator.mediaDevices?.getUserMedia) {
-        settingStore.setOutputDeviceStatus(
-          'unsupported',
-          '当前系统暂不支持在应用内请求音频设备权限，请使用系统声音设置切换输出设备。',
-        );
-        return false;
-      }
-
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        logger.info('PlayerStore', 'Output device permission granted', {
-          trackCount: stream.getTracks().length,
-        });
-        stream.getTracks().forEach((track) => track.stop());
-        await this.refreshOutputDevices(settingStore);
-
-        if (settingStore.outputDeviceStatus === 'permission') {
-          settingStore.setOutputDeviceStatus(
-            'permission',
-            '已发起权限请求，但系统仍未返回完整设备信息，请确认系统已允许麦克风或媒体设备访问。',
-          );
-          return false;
-        }
-
-        return true;
-      } catch (error) {
-        logger.warn('PlayerStore', 'Request output device permission failed:', error);
-        const errorName = error instanceof DOMException ? error.name : '';
-        if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
-          settingStore.setOutputDeviceStatus(
-            'permission',
-            '未获得音频设备权限，请在系统设置中允许麦克风或媒体设备访问后重试。',
-          );
-        } else if (errorName === 'NotFoundError') {
-          settingStore.setOutputDeviceStatus('error', '未检测到可用音频设备，请连接设备后重试。');
-        } else {
-          settingStore.setOutputDeviceStatus('error', '请求音频设备权限失败，请稍后重试。');
-        }
-        return false;
-      }
+      // mpv 直接获取系统设备列表，不需要浏览器权限
+      await this.refreshOutputDevices(settingStore);
+      return true;
     },
 
     async applyOutputDevice(
@@ -1638,22 +1726,56 @@ export const usePlayerStore = defineStore('player', {
       settingStore = useSettingStore(),
       options?: { persistSelection?: boolean },
     ) {
-      const targetDeviceId = deviceId;
       const persistSelection = options?.persistSelection ?? true;
+      const mpvDevice = !deviceId || deviceId === 'default' ? 'auto' : deviceId;
+      const exclusive = settingStore.exclusiveAudioDevice;
       logger.info('PlayerStore', 'Applying output device', {
-        requestedDeviceId: targetDeviceId,
-        currentOutputDevice: settingStore.outputDevice,
+        requestedDeviceId: deviceId,
+        mpvDevice,
+        exclusive,
         persistSelection,
       });
-      const applied = await engine.setOutputDevice(targetDeviceId);
-      if (applied) {
-        this.appliedOutputDeviceId = targetDeviceId;
+
+      // 独占模式：只在状态真正变化时才 stop + 重设，避免设备刷新时打断播放
+      const mpv = window.electron?.mpv;
+      const exclusiveChanged = exclusive !== (this._lastAppliedExclusive ?? false);
+      let applied = false;
+      if (exclusiveChanged) {
+        const wasPlaying = this.isPlaying;
+        try {
+          await mpv?.setExclusive(exclusive);
+        } catch {
+          // 旧版 mpv 可能不支持
+        }
+        this._lastAppliedExclusive = exclusive;
+
+        applied = await engine.setOutputDevice(mpvDevice);
+        if (applied) {
+          this.appliedOutputDeviceId = deviceId;
+        }
+
+        // 独占切换后恢复播放：先清除 sourceUrl 让 setSource 能重新加载
+        if (wasPlaying && this.currentTrackId && this.currentAudioUrl) {
+          const savedUrl = this.currentAudioUrl;
+          const savedTime = this.currentTime;
+          engine.reset();
+          engine.setSource(savedUrl);
+          await engine.play();
+          if (savedTime > 0) {
+            engine.seek(savedTime);
+          }
+        }
+      } else {
+        applied = await engine.setOutputDevice(mpvDevice);
+        if (applied) {
+          this.appliedOutputDeviceId = deviceId;
+        }
       }
-      if (!applied && targetDeviceId !== 'default') {
+      if (!applied && deviceId !== 'default') {
         logger.warn('PlayerStore', 'Apply output device failed, falling back to default', {
-          requestedDeviceId: targetDeviceId,
+          requestedDeviceId: deviceId,
         });
-        await engine.setOutputDevice('default');
+        await engine.setOutputDevice('auto');
         this.appliedOutputDeviceId = 'default';
         if (persistSelection) {
           settingStore.outputDevice = 'default';
@@ -1665,8 +1787,8 @@ export const usePlayerStore = defineStore('player', {
             : '当前设备不支持切换到所选输出，已临时回退到系统默认输出。',
         );
       } else if (!applied) {
-        logger.warn('PlayerStore', 'Apply output device unsupported in current environment', {
-          requestedDeviceId: targetDeviceId,
+        logger.warn('PlayerStore', 'Apply output device unsupported', {
+          requestedDeviceId: deviceId,
         });
         settingStore.setOutputDeviceStatus(
           'unsupported',
@@ -1680,16 +1802,34 @@ export const usePlayerStore = defineStore('player', {
         );
       } else {
         const matched = settingStore.outputDevices.find((item) => item.value === deviceId);
+        const deviceLabel = matched?.label || deviceId;
         logger.info('PlayerStore', 'Output device switched successfully', {
-          requestedDeviceId: targetDeviceId,
-          label: matched?.label || '所选输出设备',
+          requestedDeviceId: deviceId,
+          label: deviceLabel,
+          exclusive,
         });
-        settingStore.setOutputDeviceStatus(
-          'ready',
-          `已切换到 ${matched?.label || '所选输出设备'}。`,
-        );
+        settingStore.setOutputDeviceStatus('ready', `已切换到 ${deviceLabel}。`);
       }
-      settingStore.outputDeviceType = 'default';
+    },
+
+    /**
+     * 如果音效是人声/伴奏且 URL 指向 MKV 文件，通过自定义协议提取对应音轨。
+     * 否则原样返回 URL。
+     */
+    async resolveVocalExtractUrl(
+      url: string,
+      effect: AudioEffectValue,
+      hash: string,
+    ): Promise<string> {
+      if (effect !== 'vocal' && effect !== 'accompaniment') return url;
+      if (!url.toLowerCase().includes('.mkv')) return url;
+
+      // 人声=音轨2，伴奏=音轨1
+      const trackNum = effect === 'vocal' ? 2 : 1;
+
+      const proxyUrl = `mpv-mkv://track=${trackNum}&url=${encodeURIComponent(url)}`;
+      logger.info('PlayerStore', 'Resolved MKV extract url', { effect, trackNum, hash });
+      return proxyUrl;
     },
 
     async resolveAudioUrl(
@@ -1702,7 +1842,7 @@ export const usePlayerStore = defineStore('player', {
           'Resolve audio url skipped because track hash is missing',
           summarizeSong(track),
         );
-        return { url: '', quality: null, effect: 'none' };
+        return { url: '', quality: null, effect: 'none', loudness: null };
       }
       const canReuseCurrentSource =
         !!track.audioUrl &&
@@ -1721,6 +1861,7 @@ export const usePlayerStore = defineStore('player', {
           url: track.audioUrl!,
           quality: this.currentResolvedAudioQuality,
           effect: this.currentResolvedAudioEffect,
+          loudness: null,
         };
       }
 
@@ -1751,13 +1892,17 @@ export const usePlayerStore = defineStore('player', {
             summarizeSong(track),
           );
         }
-        return { url: cloudUrl ?? '', quality: null, effect: 'none' };
+        return { url: cloudUrl ?? '', quality: null, effect: 'none', loudness: null };
       }
 
       const relateGoods = await this.ensureTrackRelateGoods(track, { forceRefresh: true });
 
       if (audioEffect !== 'none') {
-        const matchedEffect = relateGoods.find((item) => item.quality === audioEffect && item.hash);
+        // 人声/伴奏需要特殊处理：用 acappella 请求 MKV，再通过本地代理提取音轨
+        const isVocalEffect = audioEffect === 'vocal' || audioEffect === 'accompaniment';
+        const apiEffect = isVocalEffect ? 'acappella' : audioEffect;
+
+        const matchedEffect = relateGoods.find((item) => item.quality === apiEffect && item.hash);
         const effectHashes = [matchedEffect?.hash, track.hash].filter(
           (value, index, list): value is string => !!value && list.indexOf(value) === index,
         );
@@ -1767,18 +1912,25 @@ export const usePlayerStore = defineStore('player', {
             logger.debug('PlayerStore', 'Trying effect audio url', {
               track: summarizeSong(track),
               audioEffect,
+              apiEffect,
               hash: effectHash,
               source: effectHash === matchedEffect?.hash ? 'relateGoods' : 'track',
             });
-            const effectRes = await getSongUrl(effectHash, audioEffect);
-            const effectUrl = resolveUrlFromResponse(effectRes);
+            const effectRes = await getSongUrl(effectHash, apiEffect);
+            let effectUrl = resolveUrlFromResponse(effectRes);
             if (effectUrl) {
+              effectUrl = await this.resolveVocalExtractUrl(effectUrl, audioEffect, effectHash);
               logger.info('PlayerStore', 'Resolved effect audio url successfully', {
                 track: summarizeSong(track),
                 audioEffect,
                 hash: effectHash,
               });
-              return { url: effectUrl, quality: audioQuality, effect: audioEffect };
+              return {
+                url: effectUrl,
+                quality: audioQuality,
+                effect: audioEffect,
+                loudness: resolveTrackLoudness(effectRes),
+              };
             }
           } catch (error) {
             logger.warn('PlayerStore', 'Fetch effect url failed:', error, {
@@ -1820,7 +1972,7 @@ export const usePlayerStore = defineStore('player', {
               track: summarizeSong(track),
               quality,
             });
-            return { url, quality, effect: 'none' };
+            return { url, quality, effect: 'none', loudness: resolveTrackLoudness(res) };
           }
         } catch (error) {
           logger.warn('PlayerStore', 'Fetch quality url failed:', error);
@@ -1846,6 +1998,7 @@ export const usePlayerStore = defineStore('player', {
               url,
               quality: this.getResolvedAudioQuality(track, settingStore),
               effect: 'none',
+              loudness: resolveTrackLoudness(res),
             };
           }
         } catch (error) {
@@ -1868,6 +2021,7 @@ export const usePlayerStore = defineStore('player', {
             url,
             quality: this.getResolvedAudioQuality(track, settingStore),
             effect: 'none',
+            loudness: resolveTrackLoudness(res),
           };
         }
       } catch (error) {
@@ -1880,7 +2034,7 @@ export const usePlayerStore = defineStore('player', {
         audioEffect,
         compatibilityMode,
       });
-      return { url: '', quality: null, effect: 'none' };
+      return { url: '', quality: null, effect: 'none', loudness: null };
     },
 
     async refreshCurrentTrack() {
@@ -1949,14 +2103,47 @@ export const usePlayerStore = defineStore('player', {
       this.currentResolvedAudioQuality = resolved.quality;
       this.currentResolvedAudioEffect = resolved.effect;
       track.audioUrl = resolved.url;
+      const savedDuration = this.duration;
       engine.setSource(resolved.url);
+      // mpv 推送的 duration 优先；savedDuration 仅在 mpv 尚未推送时临时填充，防止进度条闪烁
+      if (!this.duration && !engine.duration && savedDuration) {
+        this.duration = savedDuration;
+      }
+      engine.applyTrackLoudness(resolved.loudness);
       engine.setPlaybackRate(this.playbackRate);
       void this.fetchClimaxMarks(track);
 
+      // 音效切换后新文件时长可能比原文件短，需要 clamp 防止 seek 越界触发 EOF
       if (previousTime > 0) {
-        engine.seek(previousTime);
-        this.currentTime = previousTime;
-        useLyricStore().updateCurrentIndex(previousTime);
+        // 设置标志，防止 seek 越界时触发的 EOF 被误处理为正常播放结束
+        this.recentSeekIgnoreEnd = true;
+        window.setTimeout(() => {
+          this.recentSeekIgnoreEnd = false;
+        }, 1500);
+
+        // 等待 mpv 推送新文件的 duration（轮询，最多等 500ms）
+        let actualDuration = engine.duration;
+        if (actualDuration <= 0) {
+          for (let i = 0; i < 10; i++) {
+            await new Promise((r) => window.setTimeout(r, 50));
+            actualDuration = engine.duration;
+            if (actualDuration > 0) break;
+          }
+        }
+
+        // clamp：如果新文件时长已知且 previousTime 超出，回到开头
+        let safeTime = previousTime;
+        if (actualDuration > 0 && previousTime >= actualDuration - 0.5) {
+          logger.warn('PlayerStore', 'Seek position exceeds new source duration, reset to 0', {
+            previousTime,
+            actualDuration,
+            track: summarizeSong(track),
+          });
+          safeTime = 0;
+        }
+
+        engine.seek(safeTime);
+        this.currentTime = safeTime;
       }
 
       if (wasPlaying) {
@@ -1977,6 +2164,11 @@ export const usePlayerStore = defineStore('player', {
         } catch (error) {
           logger.error('PlayerStore', 'Reload track failed:', error);
         }
+      }
+
+      // mpv 未推送 duration 时用 track 元数据兜底（流式音频场景）
+      if (!this.duration && !engine.duration && track.duration) {
+        this.duration = track.duration;
       }
 
       if (wasPlaying) {
@@ -2008,9 +2200,13 @@ export const usePlayerStore = defineStore('player', {
         });
       }
       if (this.playMode === 'single') {
+        // 正常情况下 mpv 的 loop-file=inf 会自动循环，不触发 end-file
+        // 这里作为兜底：如果意外收到 end-file，重新加载文件
         logger.info('PlayerStore', 'Single repeat mode active, replay current track');
-        this.seek(0);
-        void engine.play();
+        if (this.currentAudioUrl) {
+          engine.setSource(this.currentAudioUrl);
+          void engine.play();
+        }
         return;
       }
       this.next();

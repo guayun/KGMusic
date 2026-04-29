@@ -1,8 +1,9 @@
 <script setup lang="ts">
+defineOptions({ name: 'playlist-detail' });
 import { ref, shallowRef, onMounted, computed, watch } from 'vue';
-import { useRoute } from 'vue-router';
+import { useRouteId } from '@/utils/useRouteId';
 import { getPlaylistDetail, getPlaylistTracks } from '@/api/playlist';
-import { getPlaylistComments, getFloorComments } from '@/api/comment';
+import { getPlaylistComments } from '@/api/comment';
 import SliverHeader from '@/components/music/DetailPageSliverHeader.vue';
 import ActionRow from '@/components/music/DetailPageActionRow.vue';
 import SongList from '@/components/music/SongList.vue';
@@ -14,7 +15,6 @@ import TabsTrigger from '@/components/ui/TabsTrigger.vue';
 import TabsContent from '@/components/ui/TabsContent.vue';
 import Badge from '@/components/ui/Badge.vue';
 import Dialog from '@/components/ui/Dialog.vue';
-import Scrollbar from '@/components/ui/Scrollbar.vue';
 import CommentList from '@/components/music/CommentList.vue';
 import BatchActionDrawer from '@/components/music/BatchActionDrawer.vue';
 import type { Song } from '@/models/song';
@@ -37,12 +37,13 @@ import {
   iconList,
   iconMusic,
   iconHeart,
+  iconHeartFilled,
   iconInfo,
-  iconX,
 } from '@/icons';
 import { replaceQueueAndPlay } from '@/utils/playback';
 import { useToastStore } from '@/stores/toast';
 import { toRecord } from '../../../shared/object';
+import { PagedSongLoader } from '@/utils/PagedSongLoader';
 
 const parseIntSafe = (value: unknown): number => {
   if (value == null) return 0;
@@ -51,9 +52,9 @@ const parseIntSafe = (value: unknown): number => {
   return Number.isNaN(parsed) ? 0 : parsed;
 };
 
-const route = useRoute();
+const { id: currentId, onIdChange } = useRouteId();
 // const router = useRouter();
-const getPlaylistId = () => route.params.id as string;
+const getPlaylistId = () => currentId.value;
 
 const loading = ref(true);
 const playlist = ref<PlaylistMeta | null>(null);
@@ -72,16 +73,6 @@ const commentPage = ref(1);
 const hasMoreComments = ref(true);
 const showIntroDialog = ref(false);
 const showBatchDrawer = ref(false);
-const showFloor = ref(false);
-const floorLoading = ref(false);
-const floorReplies = ref<Comment[]>([]);
-const floorTotal = ref(0);
-const floorPage = ref(1);
-const floorHasMore = ref(true);
-const activeFloorComment = ref<Comment | null>(null);
-const floorMessage = ref('');
-const floorLoadMoreMessage = ref('');
-const floorBodyRef = ref<HTMLElement | null>(null);
 
 // 搜索和定位逻辑
 const searchQuery = ref('');
@@ -244,6 +235,9 @@ const handleTabChange = (value: string | number) => {
   }
 };
 
+// 歌曲分页加载器
+let songLoader: PagedSongLoader<Song> | null = null;
+
 const fetchData = async () => {
   loading.value = true;
   try {
@@ -266,29 +260,61 @@ const fetchData = async () => {
       currentUserId,
     });
 
-    const tracksRes = await getPlaylistTracks(queryId, 1, 200);
-
-    if (tracksRes && typeof tracksRes === 'object') {
-      const hasStatus = 'status' in tracksRes;
-      const statusOk = hasStatus && (tracksRes as { status?: number }).status === 1;
-      const hasPayload = 'data' in tracksRes || 'info' in tracksRes;
-      if (statusOk || hasPayload) {
-        const payload =
-          'data' in tracksRes
-            ? (tracksRes as { data?: unknown }).data
-            : 'info' in tracksRes
-              ? (tracksRes as { info?: unknown }).info
-              : tracksRes;
-        const { songs: parsedSongs, filteredCount } = parsePlaylistTracks(payload ?? tracksRes);
-        songs.value = parsedSongs;
-        loadedSongCount.value = parsedSongs.length;
-        playlistFilteredInvalidCount.value = filteredCount;
-      }
+    // 中止上一次加载
+    if (songLoader) {
+      songLoader.abort();
     }
 
+    // 重置过滤计数
+    playlistFilteredInvalidCount.value = 0;
+
+    songLoader = new PagedSongLoader<Song>(
+      async (page, pageSize) => {
+        const res = await getPlaylistTracks(queryId, page, pageSize);
+        if (!res || typeof res !== 'object') return { items: [], hasMore: false };
+        const hasStatus = 'status' in res;
+        const statusOk = hasStatus && (res as { status?: number }).status === 1;
+        const hasPayload = 'data' in res || 'info' in res;
+        if (!statusOk && !hasPayload) return { items: [], hasMore: false };
+
+        const payload =
+          'data' in res
+            ? (res as { data?: unknown }).data
+            : 'info' in res
+              ? (res as { info?: unknown }).info
+              : res;
+        const { songs: parsedSongs, filteredCount } = parsePlaylistTracks(payload ?? res);
+        playlistFilteredInvalidCount.value += filteredCount;
+        // 返回数量不足一页说明没有更多了
+        const hasMore = parsedSongs.length + filteredCount >= pageSize;
+        return { items: parsedSongs, hasMore };
+      },
+      {
+        pageSize: 200,
+        concurrency: 3,
+        dedupeKey: (song) => String(song.id),
+        logTag: 'PlaylistDetailLoader',
+        onPageLoaded(allItems) {
+          songs.value = allItems.slice();
+          loadedSongCount.value = allItems.length;
+        },
+        onComplete(allItems) {
+          songs.value = allItems.slice();
+          loadedSongCount.value = allItems.length;
+        },
+        onError() {
+          toastStore.loadFailed('歌单歌曲');
+        },
+      },
+    );
+
+    // 首页加载完立即渲染
+    await songLoader.loadFirstPage();
+
+    // 后台加载剩余页
     const targetTotal = playlistMeta?.count ?? 0;
-    if (songs.value.length > 0 && targetTotal > songs.value.length) {
-      void fetchAllPlaylistTracks(queryId, targetTotal);
+    if (!songLoader.fullyLoaded && targetTotal > songLoader.count) {
+      void songLoader.loadRemaining();
     }
   } catch (e) {
     console.error('Fetch playlist error:', e);
@@ -297,66 +323,30 @@ const fetchData = async () => {
   }
 };
 
-const fetchAllPlaylistTracks = async (queryId: string, totalCount: number) => {
-  const pageSize = 200;
-  const seenIds = new Set(songs.value.map((song) => song.id));
-  let page = 2;
-  let bufferedSongs = [...songs.value];
+onMounted(() => {
+  fetchData();
+});
 
-  try {
-    while (bufferedSongs.length < totalCount) {
-      const res = await getPlaylistTracks(queryId, page, pageSize);
-
-      if (!res || typeof res !== 'object') break;
-      const hasStatus = 'status' in res;
-      const statusOk = hasStatus && (res as { status?: number }).status === 1;
-      const hasPayload = 'data' in res || 'info' in res;
-      if (!statusOk && !hasPayload) break;
-
-      const payload =
-        'data' in res
-          ? (res as { data?: unknown }).data
-          : 'info' in res
-            ? (res as { info?: unknown }).info
-            : res;
-      const { songs: parsedSongs, filteredCount } = parsePlaylistTracks(payload ?? res);
-      playlistFilteredInvalidCount.value += filteredCount;
-      const nextSongs = parsedSongs.filter((song) => {
-        if (seenIds.has(song.id)) return false;
-        seenIds.add(song.id);
-        return true;
-      });
-
-      if (nextSongs.length === 0) break;
-      bufferedSongs = [...bufferedSongs, ...nextSongs];
-      loadedSongCount.value = bufferedSongs.length;
-      page += 1;
-    }
-    songs.value = bufferedSongs;
-  } catch {
-    toastStore.loadFailed('歌单歌曲');
+// id 变化时重置数据（仅同路由间切换，如歌单A→歌单B）
+onIdChange(() => {
+  playlist.value = null;
+  songs.value = [];
+  loadedSongCount.value = 0;
+  playlistFilteredInvalidCount.value = 0;
+  comments.value = [];
+  hotComments.value = [];
+  commentPage.value = 1;
+  commentTotal.value = 0;
+  hasMoreComments.value = true;
+  if (songLoader) {
+    songLoader.abort();
+    songLoader = null;
   }
-};
-
-onMounted(fetchData);
-watch(
-  () => route.params.id,
-  () => {
-    playlist.value = null;
-    songs.value = [];
-    loadedSongCount.value = 0;
-    playlistFilteredInvalidCount.value = 0;
-    comments.value = [];
-    hotComments.value = [];
-    commentPage.value = 1;
-    commentTotal.value = 0;
-    hasMoreComments.value = true;
-    fetchData();
-    if (activeTab.value === 'comments') {
-      fetchComments(true);
-    }
-  },
-);
+  fetchData();
+  if (activeTab.value === 'comments') {
+    fetchComments(true);
+  }
+});
 
 watch(
   () => playlistCommentId.value,
@@ -376,7 +366,7 @@ const secondaryActions = computed(() => {
     onTap: () => void | Promise<void>;
   }[];
 
-  if (!isOwnerPlaylist.value) {
+  if (!isOwnerPlaylist.value && userStore.isLoggedIn) {
     actions.push({
       icon: iconHeart,
       label: isFavoritePlaylist.value ? '已收藏' : '收藏',
@@ -423,19 +413,31 @@ const handleRemovedFromPlaylist = (song: Song) => {
 
 const handlePlayAll = async () => {
   if (songs.value.length === 0) return;
+  const queueOpts = {
+    queueId: `queue:playlist:${playlist.value?.id ?? getPlaylistId()}`,
+    title: playlist.value?.name || '歌单',
+    subtitle: playlist.value?.nickname || playlist.value?.list_create_username || '',
+    type: 'playlist' as const,
+  };
   await replaceQueueAndPlay(
     playlistStore,
     playerStore,
     songs.value,
     playlistFilteredInvalidCount.value,
     undefined,
-    {
-      queueId: `queue:playlist:${playlist.value?.id ?? getPlaylistId()}`,
-      title: playlist.value?.name || '歌单',
-      subtitle: playlist.value?.nickname || playlist.value?.list_create_username || '',
-      type: 'playlist',
-    },
+    queueOpts,
   );
+  // 后台等待全部加载完，静默更新播放队列
+  if (songLoader && !songLoader.fullyLoaded) {
+    const allSongs = await songLoader.waitForAll();
+    if (allSongs.length > songs.value.length) {
+      playlistStore.setPlaybackQueueWithOptions(
+        allSongs.slice() as Song[],
+        playlistFilteredInvalidCount.value,
+        queueOpts,
+      );
+    }
+  }
 };
 const openBatchDrawer = () => {
   if (songs.value.length === 0) return;
@@ -444,78 +446,6 @@ const openBatchDrawer = () => {
 const handleLocate = () => songListRef.value?.scrollToActive?.();
 
 const activeSongId = computed(() => playerStore.currentTrackId ?? undefined);
-
-const openCommentPageWithFloor = (comment: Comment) => {
-  activeFloorComment.value = comment;
-  floorReplies.value = [];
-  floorTotal.value = 0;
-  floorPage.value = 1;
-  floorHasMore.value = true;
-  floorMessage.value = '';
-  floorLoadMoreMessage.value = '';
-  showFloor.value = true;
-  void fetchFloorReplies(true);
-};
-
-const handleFloorScroll = () => {
-  if (!floorBodyRef.value) return;
-  if (floorLoading.value || !floorHasMore.value) return;
-  const { scrollTop, scrollHeight, clientHeight } = floorBodyRef.value;
-  if (scrollHeight - scrollTop - clientHeight < 240) {
-    void fetchFloorReplies();
-  }
-};
-
-const fetchFloorReplies = async (reset = false) => {
-  if (!activeFloorComment.value) return;
-  if (floorLoading.value) return;
-  if (!floorHasMore.value && !reset) return;
-  if (reset) {
-    floorPage.value = 1;
-    floorReplies.value = [];
-    floorHasMore.value = true;
-  }
-  floorLoading.value = true;
-  try {
-    const comment = activeFloorComment.value;
-    const specialId = comment.specialId ?? '';
-    const tid = comment.tid ?? String(comment.id);
-    if (!specialId || !tid) {
-      floorMessage.value = '楼层评论暂不可用';
-      floorHasMore.value = false;
-      return;
-    }
-    const res = await getFloorComments({
-      specialId,
-      tid,
-      mixSongId: comment.mixSongId,
-      code: comment.code,
-      resourceType: 'playlist',
-      page: floorPage.value,
-      pagesize: 30,
-    });
-    if (res && typeof res === 'object') {
-      const payload = (res as { data?: unknown }).data ?? res;
-      const record = payload as Record<string, unknown>;
-      const list = Array.isArray(record.list) ? record.list : [];
-      const mapped = list.map(mapCommentItem);
-      floorReplies.value = reset ? mapped : [...floorReplies.value, ...mapped];
-      const totalCount = Number(record.comments_num ?? 0) || 0;
-      floorTotal.value = totalCount;
-      floorHasMore.value =
-        totalCount > 0 ? floorReplies.value.length < totalCount : mapped.length >= 30;
-      if (floorHasMore.value) floorPage.value += 1;
-      if (floorReplies.value.length === 0) {
-        floorMessage.value = String(record.message ?? '') || '暂无回复';
-      }
-    }
-  } catch {
-    floorLoadMoreMessage.value = '加载更多失败，点击重试';
-    toastStore.loadFailed('楼层评论');
-  } finally {
-    floorLoading.value = false;
-  }
-};
 
 const sortedSongs = computed(() => {
   const data = songs.value;
@@ -572,10 +502,8 @@ const sortedSongs = computed(() => {
                 }}</span>
               </div>
               <span class="text-[11px] font-semibold text-text-main/60"
-                >{{
-                  formatDate(playlist.publishDate || playlist.createTime, 'YYYY-MM-DD')
-                }}
-                创建</span
+                >{{ formatDate(playlist.publishDate || playlist.createTime, 'YYYY-MM-DD') }}
+                {{ playlist.publishDate ? '发布' : '创建' }}</span
               >
             </div>
             <div class="flex items-center flex-wrap gap-2 text-[11px] font-semibold">
@@ -620,6 +548,24 @@ const sortedSongs = computed(() => {
         </template>
 
         <template #collapsed-actions>
+          <Button
+            v-if="!isOwnerPlaylist && userStore.isLoggedIn"
+            variant="unstyled"
+            size="none"
+            @click="
+              () => {
+                if (!playlist) return;
+                if (isFavoritePlaylist) {
+                  playlistStore.unfavoritePlaylist(playlist, userStore.info?.userid);
+                } else {
+                  playlistStore.favoritePlaylist(playlist, userStore.info?.userid);
+                }
+              }
+            "
+            class="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/5 text-red-500"
+          >
+            <Icon :icon="isFavoritePlaylist ? iconHeartFilled : iconHeart" width="18" height="18" />
+          </Button>
           <Button
             variant="unstyled"
             size="none"
@@ -754,7 +700,8 @@ const sortedSongs = computed(() => {
               <CommentList
                 :comments="hotComments"
                 :loading="loadingComments"
-                :onTapReplies="openCommentPageWithFloor"
+                resourceType="playlist"
+                :fallbackMixSongId="String(currentId)"
                 compact
                 hide-empty
               />
@@ -762,7 +709,8 @@ const sortedSongs = computed(() => {
                 :comments="comments"
                 :loading="loadingComments"
                 :total="commentTotal"
-                :onTapReplies="openCommentPageWithFloor"
+                resourceType="playlist"
+                :fallbackMixSongId="String(currentId)"
                 compact
                 :hide-empty="hotComments.length > 0"
               />
@@ -790,65 +738,6 @@ const sortedSongs = computed(() => {
         descriptionClass="text-[13px]"
         showClose
       />
-      <Dialog
-        v-model:open="showFloor"
-        contentClass="comment-floor-dialog"
-        bodyClass="comment-floor-dialog-body"
-        noScroll
-      >
-        <div class="comment-floor-header">
-          <div class="comment-floor-title">楼层评论</div>
-          <Button class="comment-floor-close" variant="ghost" size="xs" @click="showFloor = false">
-            <Icon :icon="iconX" width="20" height="20" />
-          </Button>
-        </div>
-        <Scrollbar
-          class="comment-floor-body flex-1 min-h-0"
-          :content-props="{ ref: floorBodyRef }"
-          @scroll="handleFloorScroll"
-        >
-          <div class="comment-floor-body-inner">
-            <div class="comment-floor-section">原评论</div>
-            <CommentList
-              v-if="activeFloorComment"
-              :comments="[activeFloorComment]"
-              :showDivider="false"
-              :loading="false"
-              compact
-            />
-            <div class="comment-floor-section">
-              回复{{ floorTotal > 0 ? ` (${floorTotal})` : '' }}
-            </div>
-            <CommentList
-              :comments="floorReplies"
-              :loading="floorLoading"
-              :showDivider="true"
-              compact
-            />
-            <div v-if="!floorLoading && floorReplies.length === 0" class="comment-floor-empty">
-              {{ floorMessage || '暂无回复' }}
-            </div>
-            <div
-              v-if="floorHasMore || floorLoading || floorReplies.length > 0"
-              class="comment-load-more comment-load-more-floor"
-            >
-              <div v-if="floorLoading" class="comment-loading-inline">
-                <div class="comment-loading-spinner"></div>
-                <span>加载中...</span>
-              </div>
-              <Button
-                v-else-if="floorHasMore"
-                variant="outline"
-                size="xs"
-                @click="fetchFloorReplies()"
-              >
-                {{ floorLoadMoreMessage || '加载更多' }}
-              </Button>
-              <div v-else class="comment-end-hint">已加载全部评论</div>
-            </div>
-          </div>
-        </Scrollbar>
-      </Dialog>
     </template>
   </div>
 </template>
@@ -907,74 +796,10 @@ const sortedSongs = computed(() => {
   @apply px-0;
 }
 
-:global(.comment-floor-dialog) {
-  left: calc(var(--drawer-content-left, 0px) + (var(--drawer-content-width, 100vw) / 2));
-  top: calc(var(--drawer-content-top, 0px) + (var(--drawer-content-height, 100vh) / 2));
-  width: min(620px, calc(var(--drawer-content-width, 100vw) - 40px));
-  max-width: calc(var(--drawer-content-width, 100vw) - 40px);
-  max-height: min(720px, calc(var(--drawer-content-height, 100vh) - 24px));
-  padding: 24px 2px 24px 24px;
-  border-radius: 24px;
-}
-
-:global(.comment-floor-dialog .comment-floor-dialog-body) {
-  padding-right: 0;
-  margin-top: 0;
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.comment-floor-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-
-.comment-floor-title {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--color-text-main);
-}
-
-.comment-floor-close {
-  flex-shrink: 0;
-}
-
-.comment-floor-body {
-  max-height: min(580px, calc(var(--drawer-content-height, 100vh) - 180px));
-  min-height: 0;
-}
-
-.comment-floor-body-inner {
-  padding-right: 12px;
-}
-
-.comment-floor-section {
-  margin: 10px 0 12px;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--color-text-secondary);
-}
-
-.comment-floor-empty {
-  padding: 8px 0 0;
-  text-align: center;
-  color: var(--color-text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-}
-
 .comment-load-more {
   display: flex;
   justify-content: center;
   margin: 18px 0 12px;
-}
-
-.comment-load-more-floor {
-  margin-bottom: 0;
 }
 
 .comment-loading-inline {

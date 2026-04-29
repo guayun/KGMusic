@@ -1,4 +1,5 @@
 <script setup lang="ts">
+defineOptions({ name: 'explore' });
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { extractAlbumGroups, extractList } from '@/utils/extractors';
 import { usePlaylistStore } from '@/stores/playlist';
@@ -625,7 +626,7 @@ const getArtistCardProps = (artist: ArtistMeta): ExploreArtistCardProps => {
   };
 };
 
-const artistCards = computed(() => artistResults.value.map((entry) => getArtistCardProps(entry)));
+// const artistCards = computed(() => artistResults.value.map((entry) => getArtistCardProps(entry)));
 
 const scrollToArtistGroup = (letter: string) => {
   activeArtistLetter.value = letter;

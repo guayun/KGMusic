@@ -1,6 +1,8 @@
 <script setup lang="ts">
+defineOptions({ name: 'artist-detail' });
 import { ref, shallowRef, onMounted, onUnmounted, computed, watch } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
+import { useRouter } from 'vue-router';
+import { useRouteId } from '@/utils/useRouteId';
 import {
   getArtistDetail,
   getArtistSongs,
@@ -30,6 +32,7 @@ import { usePlayerStore } from '@/stores/player';
 import { useSettingStore } from '@/stores/setting';
 import { useUserStore } from '@/stores/user';
 import { useToastStore } from '@/stores/toast';
+import { PagedSongLoader } from '@/utils/PagedSongLoader';
 import type { SortField, SortOrder } from '@/components/music/SongListHeader.vue';
 import {
   iconCurrentLocation,
@@ -68,10 +71,14 @@ const settingStore = useSettingStore();
 const userStore = useUserStore();
 const toastStore = useToastStore();
 
-const route = useRoute();
 const router = useRouter();
-const getArtistId = () =>
-  String(Array.isArray(route.params.id) ? (route.params.id[0] ?? '') : (route.params.id ?? ''));
+const { id: currentId, onIdChange } = useRouteId();
+const getArtistId = () => currentId.value;
+
+const formatFansCount = (count: number): string => {
+  if (count >= 10000) return `${(count / 10000).toFixed(1).replace(/\.0$/, '')}万`;
+  return String(count);
+};
 
 const loading = ref(true);
 const loadingSongs = ref(true);
@@ -94,7 +101,7 @@ const mvTag = ref<'all' | 'official' | 'live' | 'fan' | 'artist'>('all');
 
 const activeTab = ref('songs');
 const loadedSongCount = ref(0);
-const loadedAlbumCount = computed(() => albums.value.length);
+// const loadedAlbumCount = computed(() => albums.value.length);
 const showBatchDrawer = ref(false);
 const showIntroDialog = ref(false);
 const togglingFollow = ref(false);
@@ -152,39 +159,22 @@ const sortedSongs = computed(() => {
   });
 });
 
-const fetchAllArtistSongs = async (totalCount: number) => {
-  if (songs.value.length >= totalCount) return;
-  const artistId = getArtistId();
-  const pageSize = 200;
-  const seenIds = new Set(songs.value.map((song) => song.id));
-  let page = 2;
+// 歌曲分页加载器
+let songLoader: PagedSongLoader<Song> | null = null;
 
-  let bufferedSongs = [...songs.value];
-
-  try {
-    while (bufferedSongs.length < totalCount) {
-      const res = await getArtistSongs(artistId, page, pageSize, 'hot');
-      const nextSongs = extractList(res).map((item) => mapArtistSong(artistId, item));
-      const filtered = nextSongs.filter((song) => {
-        if (seenIds.has(song.id)) return false;
-        seenIds.add(song.id);
-        return true;
-      });
-      if (filtered.length === 0) break;
-      bufferedSongs = [...bufferedSongs, ...filtered];
-      loadedSongCount.value = bufferedSongs.length;
-      page += 1;
-    }
-    songs.value = bufferedSongs;
-  } catch {
-    toastStore.loadFailed('歌手歌曲');
-  }
+const fetchAllArtistSongs = (totalCount: number) => {
+  if (!songLoader || songLoader.fullyLoaded) return;
+  if (songLoader.count >= totalCount) return;
+  void songLoader.loadRemaining();
 };
 
 const fetchData = async () => {
   const artistId = getArtistId();
   loading.value = true;
   loadingSongs.value = true;
+
+  // 0. 确保关注列表已加载
+  void userStore.ensureFollowedArtists();
 
   // 1. 获取歌手详情
   const detailTask = getArtistDetail(artistId)
@@ -199,17 +189,44 @@ const fetchData = async () => {
       loading.value = false;
     });
 
-  // 2. 获取歌曲列表
-  const songsTask = getArtistSongs(artistId, 1, 200, 'hot')
-    .then((res) => {
-      const fetched = extractList(res).map((item) => mapArtistSong(artistId, item));
-      songs.value = fetched;
-      loadedSongCount.value = fetched.length;
-      loadingSongs.value = false;
+  // 2. 中止上一次加载
+  if (songLoader) {
+    songLoader.abort();
+  }
 
-      const totalSongs = artist.value?.songCount ?? fetched.length;
-      if (totalSongs > fetched.length) {
-        void fetchAllArtistSongs(totalSongs);
+  // 3. 创建加载器获取歌曲
+  songLoader = new PagedSongLoader<Song>(
+    async (page, pageSize) => {
+      const res = await getArtistSongs(artistId, page, pageSize, 'hot');
+      const items = extractList(res).map((item) => mapArtistSong(artistId, item));
+      return { items, hasMore: items.length >= pageSize };
+    },
+    {
+      pageSize: 200,
+      concurrency: 3,
+      dedupeKey: (song) => String(song.id),
+      logTag: 'ArtistSongsLoader',
+      onPageLoaded(allItems) {
+        songs.value = allItems.slice();
+        loadedSongCount.value = allItems.length;
+      },
+      onComplete(allItems) {
+        songs.value = allItems.slice();
+        loadedSongCount.value = allItems.length;
+      },
+      onError() {
+        toastStore.loadFailed('歌手歌曲');
+      },
+    },
+  );
+
+  const songsTask = songLoader
+    .loadFirstPage()
+    .then(() => {
+      loadingSongs.value = false;
+      const totalSongs = artist.value?.songCount ?? songLoader!.count;
+      if (totalSongs > songLoader!.count) {
+        fetchAllArtistSongs(totalSongs);
       }
     })
     .catch(() => {
@@ -219,30 +236,32 @@ const fetchData = async () => {
   await Promise.allSettled([detailTask, songsTask]);
 };
 
-watch(
-  () => route.params.id,
-  () => {
-    artist.value = null;
-    songs.value = [];
-    albums.value = [];
-    mvs.value = [];
-    mvFetched.value = false;
-    mvTotal.value = 0;
-    mvPage.value = 1;
-    mvHasMore.value = false;
-    albumPage.value = 1;
-    albumHasMore.value = false;
-    albumFetched.value = false;
-    loadedSongCount.value = 0;
-    searchQuery.value = '';
-    sortField.value = null;
-    sortOrder.value = null;
-    activeTab.value = 'songs';
-    void fetchData();
-  },
-);
+// id 变化时重置数据（仅同路由间切换，如歌手A→歌手B）
+onIdChange(() => {
+  artist.value = null;
+  songs.value = [];
+  albums.value = [];
+  mvs.value = [];
+  mvFetched.value = false;
+  mvTotal.value = 0;
+  mvPage.value = 1;
+  mvHasMore.value = false;
+  albumPage.value = 1;
+  albumHasMore.value = false;
+  albumFetched.value = false;
+  loadedSongCount.value = 0;
+  searchQuery.value = '';
+  sortField.value = null;
+  sortOrder.value = null;
+  activeTab.value = 'songs';
+  if (songLoader) {
+    songLoader.abort();
+    songLoader = null;
+  }
+  void fetchData();
+});
 
-const isFollowed = computed(() => artist.value?.isFollowed === true);
+const isFollowed = computed(() => userStore.isArtistFollowed(artist.value?.id ?? ''));
 
 const isRequestSuccessful = (payload: unknown) => {
   if (!payload || typeof payload !== 'object') return false;
@@ -260,7 +279,7 @@ const toggleArtistFollow = async () => {
   }
 
   togglingFollow.value = true;
-  const previousFollowed = artist.value.isFollowed === true;
+  const previousFollowed = isFollowed.value;
 
   try {
     const response = previousFollowed
@@ -268,13 +287,11 @@ const toggleArtistFollow = async () => {
       : await followArtist(artist.value.id);
 
     if (isRequestSuccessful(response)) {
-      artist.value = {
-        ...artist.value,
-        isFollowed: !previousFollowed,
-      };
       if (previousFollowed) {
+        userStore.removeFollowedArtist(artist.value.id);
         toastStore.actionCompleted('已取消关注');
       } else {
+        userStore.addFollowedArtist(artist.value.id);
         toastStore.actionSucceeded('关注');
       }
     } else {
@@ -288,7 +305,7 @@ const toggleArtistFollow = async () => {
 };
 
 const secondaryActions = computed(() => {
-  if (!artist.value) return [];
+  if (!artist.value || !userStore.isLoggedIn) return [];
 
   return [
     {
@@ -318,12 +335,20 @@ const handleSongDoubleTapPlay = async (song: Song) => {
 
 const handlePlayAll = async () => {
   if (songs.value.length === 0) return;
-  await replaceQueueAndPlay(playlistStore, playerStore, songs.value, 0, undefined, {
+  const queueOpts = {
     queueId: `queue:artist:${artist.value?.id ?? getArtistId()}`,
     title: artist.value?.name || '歌手',
     subtitle: '',
-    type: 'artist',
-  });
+    type: 'artist' as const,
+  };
+  await replaceQueueAndPlay(playlistStore, playerStore, songs.value, 0, undefined, queueOpts);
+  // 后台等待全部加载完，静默更新播放队列
+  if (songLoader && !songLoader.fullyLoaded) {
+    const allSongs = await songLoader.waitForAll();
+    if (allSongs.length > songs.value.length) {
+      playlistStore.setPlaybackQueueWithOptions(allSongs.slice() as Song[], 0, queueOpts);
+    }
+  }
 };
 const openBatchDrawer = () => {
   if (songs.value.length === 0) return;
@@ -388,7 +413,7 @@ const fetchMvs = async (page = 1) => {
   }
 };
 
-const loadedMvCount = computed(() => (mvFetched.value ? mvTotal.value : 0));
+// const loadedMvCount = computed(() => (mvFetched.value ? mvTotal.value : 0));
 
 const mvTagOptions = [
   { value: 'all' as const, label: '全部' },
@@ -484,14 +509,24 @@ onUnmounted(() => {
         typeLabel="ARTIST"
         :title="artist.name"
         :coverUrl="artist.pic"
-        :hasDetails="false"
-        :expandedHeight="176"
+        :hasDetails="true"
+        :expandedHeight="196"
       >
         <template #details>
-          <div class="flex flex-col gap-1 text-text-main/60">
+          <div class="flex flex-col gap-1.5 text-text-main/60">
             <div class="text-[13px] font-semibold text-primary">
               {{ artist.songCount || songs.length }} 歌曲 •
               {{ artist.albumCount || albums.length }} 专辑
+              <template v-if="artist.mvCount"> • {{ artist.mvCount }} MV</template>
+            </div>
+            <div class="flex items-center gap-3 text-[12px] text-text-secondary">
+              <span v-if="artist.fansCount" class="flex items-center gap-1">
+                <span class="font-semibold text-text-main/80">{{
+                  formatFansCount(artist.fansCount)
+                }}</span>
+                粉丝
+              </span>
+              <span v-if="artist.birthday">🎂 {{ artist.birthday }}</span>
             </div>
           </div>
         </template>
@@ -506,6 +541,7 @@ onUnmounted(() => {
 
         <template #collapsed-actions>
           <Button
+            v-if="userStore.isLoggedIn"
             variant="unstyled"
             size="none"
             @click="toggleArtistFollow"

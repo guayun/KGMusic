@@ -6,6 +6,7 @@ import type {
   OutputDeviceOption,
   OutputDeviceStatus,
 } from '../types';
+import { buildFontFamily } from '../../shared/font';
 
 export const DEFAULT_SHORTCUT_LABELS: Record<string, string> = {
   togglePlayback: '⌘Space',
@@ -51,6 +52,9 @@ export const useSettingStore = defineStore('setting', {
     lyricBackdropOpacity: 50,
     lyricCarouselEnabled: true,
     lyricCarouselInterval: 15,
+    lyricAutoCollapseDelay: 5,
+    lyricAutoCollapseEnabled: true,
+    lyricAdaptiveColor: true,
     autoNext: false,
     autoNextDelaySeconds: 3,
     autoNextMaxAttempts: 10,
@@ -65,17 +69,29 @@ export const useSettingStore = defineStore('setting', {
     outputDevice: 'default',
     outputDevices: [{ label: '系统默认', value: 'default' }] as OutputDeviceOption[],
     outputDeviceType: 'default' as 'default' | 'wasapi',
+    exclusiveAudioDevice: false,
     outputDeviceStatus: 'idle' as OutputDeviceStatus,
     outputDeviceStatusMessage: '',
     outputDeviceDisconnectBehavior: 'pause' as OutputDeviceDisconnectBehavior,
     autoReceiveVip: false,
     showAudioQualityBadge: true,
+    volumeNormalization: true,
+    volumeNormalizationLufs: -14,
+    keepAliveEnabled: true,
+    keepAliveMax: 20,
+    keepAliveRoutes: ['playlist-detail', 'artist-detail', 'album-detail', 'favorites'] as string[],
+    playResumeTimeout: 5,
     silentUpdate: true,
+    autoCheckUpdate: true,
     checkPrerelease: false,
     appVersion: '',
     isPrerelease: false,
     searchHistory: [] as string[],
     userAgreementAccepted: false,
+    disableGpuAcceleration: false,
+    // 字体设置
+    globalFont: 'system-ui',
+    lyricFont: 'follow',
   }),
   actions: {
     setTheme(theme: ThemeMode) {
@@ -156,6 +172,14 @@ export const useSettingStore = defineStore('setting', {
         });
       }
     },
+    syncDisableGpuAcceleration() {
+      if (window.electron?.ipcRenderer) {
+        window.electron.ipcRenderer.send(
+          'update-disable-gpu-acceleration',
+          this.disableGpuAcceleration,
+        );
+      }
+    },
     setOutputDeviceStatus(status: OutputDeviceStatus, message = '') {
       this.outputDeviceStatus = status;
       this.outputDeviceStatusMessage = message;
@@ -176,6 +200,25 @@ export const useSettingStore = defineStore('setting', {
     },
     acceptUserAgreement() {
       this.userAgreementAccepted = true;
+    },
+    // 获取系统字体列表
+    async fetchSystemFonts(): Promise<string[]> {
+      if (!window.electron?.fonts) return [];
+      try {
+        const fonts = await window.electron.fonts.getAll();
+        return (fonts ?? []).map((f: string) => f.replace(/^['"]+|['"]+$/g, ''));
+      } catch {
+        return [];
+      }
+    },
+    // 构建全局 font-family 字符串
+    buildGlobalFontFamily(): string {
+      return buildFontFamily(this.globalFont);
+    },
+    // 构建歌词区域 font-family 字符串
+    buildLyricFontFamily(): string {
+      if (!this.lyricFont || this.lyricFont === 'follow') return this.buildGlobalFontFamily();
+      return buildFontFamily(this.lyricFont);
     },
   },
   persist: true,

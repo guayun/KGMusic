@@ -9,6 +9,7 @@ import { useSettingStore } from './stores/setting';
 import { initShortcutSync, syncGlobalShortcuts } from '@/utils/shortcuts';
 import { initDesktopLyricSync } from '@/desktopLyric/sync';
 import type { UpdateCheckResult } from '../shared/app';
+import LyricView from '@/views/Lyric.vue';
 
 const player = usePlayerStore();
 const settings = useSettingStore();
@@ -26,6 +27,10 @@ const updateTheme = () => {
     settings.theme === 'dark' ||
     (settings.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.classList.toggle('dark', isDark);
+};
+
+const applyGlobalFont = () => {
+  document.documentElement.style.fontFamily = settings.buildGlobalFontFamily();
 };
 
 const syncTrayPlayback = () => {
@@ -51,6 +56,7 @@ onMounted(() => {
     disposeDesktopLyricSync = dispose;
   });
   updateTheme();
+  applyGlobalFont();
   settings.syncTheme();
   settings.syncCloseBehavior();
   settings.syncRememberWindowSize();
@@ -62,9 +68,11 @@ onMounted(() => {
     }) ?? null;
   syncTrayPlayback();
   window.electron?.ipcRenderer?.on('update-check-result', handleSilentUpdateCheckResult);
-  silentUpdateCheckTimer = window.setTimeout(() => {
-    settings.checkForUpdates(true);
-  }, 4000);
+  if (settings.autoCheckUpdate) {
+    silentUpdateCheckTimer = window.setTimeout(() => {
+      settings.checkForUpdates(true);
+    }, 4000);
+  }
   colorSchemeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
   colorSchemeMediaQuery.addEventListener('change', updateTheme);
 });
@@ -86,6 +94,7 @@ onUnmounted(() => {
 });
 
 watch(() => settings.theme, updateTheme);
+watch(() => settings.globalFont, applyGlobalFont);
 watch(
   () => settings.rememberWindowSize,
   () => settings.syncRememberWindowSize(),
@@ -116,6 +125,11 @@ watch(
       <component :is="Component" />
     </transition>
   </RouterView>
+  <Teleport to="body">
+    <Transition name="lyric-overlay">
+      <LyricView v-if="player.isLyricViewOpen" />
+    </Transition>
+  </Teleport>
   <AuthExpiredDialog />
   <ToastViewport />
   <UpdateDialog
@@ -139,5 +153,30 @@ watch(
 .page-leave-to {
   opacity: 0;
   transform: translateY(-8px);
+}
+
+/* 歌词覆盖层动画 */
+.lyric-overlay-enter-active {
+  transition:
+    transform 0.35s cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform, opacity;
+}
+
+.lyric-overlay-leave-active {
+  transition:
+    transform 0.3s cubic-bezier(0.4, 0, 0.6, 1),
+    opacity 0.2s cubic-bezier(0.4, 0, 1, 1);
+  will-change: transform, opacity;
+}
+
+.lyric-overlay-enter-from {
+  opacity: 0;
+  transform: translateY(100%);
+}
+
+.lyric-overlay-leave-to {
+  opacity: 0;
+  transform: translateY(100%);
 }
 </style>

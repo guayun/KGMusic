@@ -19,12 +19,6 @@ const routes: RouteRecordRaw[] = [
     meta: { skipHistory: true },
   },
   {
-    path: '/lyric',
-    name: 'lyric',
-    component: () => import('@/views/Lyric.vue'),
-    meta: { skipHistory: true },
-  },
-  {
     path: '/main',
     component: () => import('@/layouts/MainLayout.vue'),
     children: [
@@ -57,6 +51,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '搜索' },
       },
       {
+        path: 'recognize',
+        name: 'recognize',
+        component: () => import('@/views/Recognize.vue'),
+        meta: { title: '听歌识曲', keepAlive: true },
+      },
+      {
         path: 'ranking',
         name: 'ranking',
         component: () => import('@/views/Ranking.vue'),
@@ -67,9 +67,10 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/History.vue'),
       },
       {
-        path: 'liked',
-        name: 'liked-songs',
-        component: () => import('@/views/LikedSongs.vue'),
+        path: 'favorites',
+        name: 'favorites',
+        component: () => import('@/views/Favorites.vue'),
+        meta: { title: '我最喜爱' },
       },
       {
         path: 'cloud',

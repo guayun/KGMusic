@@ -62,8 +62,7 @@ export const DEFAULT_DESKTOP_LYRIC_SETTINGS: DesktopLyricSettings = {
   theme: 'system',
   opacity: 0.92,
   scale: 1,
-  fontFamily:
-    'SF Pro Display, PingFang SC, Hiragino Sans GB, Microsoft YaHei, Inter, system-ui, sans-serif',
+  fontFamily: 'system-ui',
   inactiveFontSize: 26,
   activeFontSize: 40,
   secondaryFontSize: 18,
@@ -85,10 +84,12 @@ export type DesktopLyricSnapshot = {
   currentIndex: number;
   settings: DesktopLyricSettings;
   lockPhase: DesktopLyricLockPhase;
+  /** 歌词同步警告（实际播放时长与歌词时长差异过大） */
+  lyricSyncWarning?: boolean;
 };
 
 export type DesktopLyricSnapshotPatch = Partial<
-  Pick<DesktopLyricSnapshot, 'playback' | 'lyrics' | 'currentIndex'>
+  Pick<DesktopLyricSnapshot, 'playback' | 'lyrics' | 'currentIndex' | 'lyricSyncWarning'>
 > & {
   settings?: Partial<DesktopLyricSettings>;
 };

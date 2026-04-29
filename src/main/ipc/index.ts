@@ -5,6 +5,7 @@ import { registerSettingsHandlers } from './settings';
 import { registerShortcutHandlers } from './shortcuts';
 import { registerTrayHandlers } from './tray';
 import { registerDesktopLyricHandlers } from '../desktopLyric';
+import { registerShazamHandlers } from './shazam';
 import type { IpcContext } from './types';
 
 let registered = false;
@@ -17,6 +18,7 @@ export const registerIpcHandlers = (context: IpcContext) => {
   registerShortcutHandlers(context);
   registerTrayHandlers();
   registerDesktopLyricHandlers();
+  registerShazamHandlers();
   registered = true;
 };
 
@@ -48,6 +50,7 @@ export const unregisterIpcHandlers = () => {
   ipcMain.removeHandler('api:request');
   ipcMain.removeHandler('app:get-info');
   ipcMain.removeHandler('app:get-changelog');
+  ipcMain.removeHandler('get-all-fonts');
   ipcMain.removeHandler('desktop-lyric:get-snapshot');
   ipcMain.removeHandler('desktop-lyric:get-bounds');
   ipcMain.removeHandler('desktop-lyric:get-virtual-screen-bounds');

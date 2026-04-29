@@ -8,7 +8,7 @@ import {
   watch,
   type ComponentPublicInstance,
 } from 'vue';
-import { useRafFn, useThrottleFn, useTimeoutFn, useWindowSize, useDebounceFn } from '@vueuse/core';
+import { useRafFn, useThrottleFn, useWindowSize, useDebounceFn } from '@vueuse/core';
 import {
   iconLanguage,
   iconLock,
@@ -25,6 +25,7 @@ import type {
   LyricLinePayload,
   LyricCharacterPayload,
 } from '../../shared/desktop-lyric';
+import { buildFontFamily } from '../../shared/font';
 
 // ── 渲染行类型 ──
 
@@ -56,22 +57,39 @@ const { pause: pauseSeek, resume: resumeSeek } = useRafFn(() => {
   }
 });
 
-// 300ms 提前量
-const LYRIC_LOOKAHEAD = 300;
+// 逐字高亮提前量（毫秒）
+const LYRIC_LOOKAHEAD = 150;
+// 锚点同步阈值（毫秒）
 const SYNC_THRESHOLD = 300;
-
 // ── 计算属性 ──
 
 const settings = computed(() => snapshot.value?.settings);
 const playback = computed(() => snapshot.value?.playback);
 const lyrics = computed(() => snapshot.value?.lyrics ?? []);
-const currentIndex = computed(() => snapshot.value?.currentIndex ?? -1);
 const isLocked = computed(() => settings.value?.locked ?? false);
+
+// 本地计算 currentIndex，不再依赖主窗口传来的值
+const currentIndex = computed(() => {
+  const lines = lyrics.value;
+  if (lines.length === 0) return -1;
+  const seekMs = playSeekMs.value;
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const start = lines[i].characters?.[0]?.startTime ?? Math.round(lines[i].time * 1000);
+    if (seekMs >= start) {
+      idx = i;
+    } else {
+      break;
+    }
+  }
+  return idx;
+});
 const isPlaying = computed(() => playback.value?.isPlaying ?? false);
 const songName = computed(() => playback.value?.title || 'EchoMusic');
 const artistName = computed(() => playback.value?.artist || '');
 const alignment = computed(() => settings.value?.alignment ?? 'center');
 const doubleLine = computed(() => settings.value?.doubleLine ?? true);
+const lyricSyncWarning = computed(() => snapshot.value?.lyricSyncWarning ?? false);
 const secondaryEnabled = computed(() => {
   const s = settings.value;
   return (s?.wantTranslation ?? false) || (s?.wantRomanization ?? false);
@@ -100,29 +118,64 @@ const secondaryDisplayLabel = computed(() => {
 });
 const playedColor = computed(() => settings.value?.playedColor ?? '#31cfa1');
 const unplayedColor = computed(() => settings.value?.unplayedColor ?? '#7a7a7a');
-const shadowColor = computed(() =>
-  settings.value?.strokeEnabled
-    ? (settings.value?.strokeColor ?? 'rgba(0,0,0,0.5)')
-    : 'rgba(0,0,0,0.5)',
-);
-const fontFamily = computed(() => settings.value?.fontFamily ?? 'system-ui');
+const fontFamily = computed(() => {
+  const raw = settings.value?.fontFamily ?? 'system-ui';
+  // 跟随全局时使用系统默认
+  return buildFontFamily(raw === 'follow' ? 'system-ui' : raw);
+});
 const fontWeight = computed(() => (settings.value?.bold ? 700 : 400));
 
 // hover 状态
 const isHovered = ref(false);
-const { start: startHoverTimer } = useTimeoutFn(
-  () => {
-    isHovered.value = false;
-  },
-  1000,
-  { immediate: false },
-);
-const handleMouseMove = () => {
-  isHovered.value = true;
-  startHoverTimer();
+
+const handleMouseMove = (event: MouseEvent) => {
+  const target = event.target as HTMLElement | null;
+
+  if (isLocked.value) {
+    // 锁定状态：鼠标在窗口内任意位置都显示锁定按钮，但只有在按钮上才取消穿透
+    const container = document.querySelector('.desktop-lyric');
+    if (container) {
+      const rect = container.getBoundingClientRect();
+      const isInContainer =
+        event.clientX >= rect.left &&
+        event.clientX <= rect.right &&
+        event.clientY >= rect.top &&
+        event.clientY <= rect.bottom;
+      isHovered.value = isInContainer;
+    }
+    const isOnLockBtn = target?.closest('.lock-btn') !== null;
+    window.electron?.desktopLyric?.setIgnoreMouseEvents(!isOnLockBtn);
+    return;
+  }
+
+  // 非锁定状态：检测鼠标是否在歌词内容或工具栏区域
+  const isOnContent = target?.closest('.lyric-container') !== null;
+  const isOnHeader = target?.closest('.header') !== null;
+
+  if (isOnContent || isOnHeader) {
+    isHovered.value = true;
+  }
+
+  // 检测鼠标是否完全离开窗口容器
+  const container = document.querySelector('.desktop-lyric');
+  if (container) {
+    const rect = container.getBoundingClientRect();
+    const isInContainer =
+      event.clientX >= rect.left &&
+      event.clientX <= rect.right &&
+      event.clientY >= rect.top &&
+      event.clientY <= rect.bottom;
+    if (!isInContainer) {
+      isHovered.value = false;
+    }
+  }
 };
+
 const handleMouseLeave = () => {
   isHovered.value = false;
+  if (isLocked.value) {
+    window.electron?.desktopLyric?.setIgnoreMouseEvents(true);
+  }
 };
 
 // ── 占位行 ──
@@ -219,8 +272,12 @@ const renderLyricLines = computed<RenderLine[]>(() => {
     }
     return result;
   }
-  // 单行模式
-  return [{ line: current, index: idx, key: `${idx}-orig`, active: true }];
+  // 单行模式：也预渲染下一句（视觉隐藏），切换时走 move 动画而非 enter/leave
+  const result: RenderLine[] = [{ line: current, index: idx, key: `${idx}-orig`, active: true }];
+  if (next) {
+    result.push({ line: next, index: idx + 1, key: `${idx + 1}-orig`, active: false });
+  }
+  return result;
 });
 
 // 逐字歌词样式
@@ -456,12 +513,12 @@ watch(computedFontSize, (size) => {
 
 const toggleLyricLock = () => {
   void window.electron?.desktopLyric?.toggleLock();
-};
-
-const tempToggleLyricLock = (lock: boolean) => {
-  if (!isLocked.value) return;
-  // 直接用 preload 暴露的 API，不走 sendToMain 包装
-  window.electron?.desktopLyric?.setIgnoreMouseEvents(lock);
+  // 锁定后立即设置穿透并重置 hover
+  if (!isLocked.value) {
+    // 即将变为锁定状态
+    isHovered.value = false;
+    window.electron?.desktopLyric?.setIgnoreMouseEvents(true);
+  }
 };
 
 // ── 操作命令 ──
@@ -519,15 +576,16 @@ const playNext = () => {
 
 // ── 锚点同步 ──
 
-const syncAnchor = () => {
+const syncAnchor = (force = false) => {
   const state = playback.value;
   if (!state) return;
   const newBaseMs = Math.round((state.currentTime || 0) * 1000);
   const ipcDelay = performance.now() - (state.updatedAt || performance.now());
   const compensated = ipcDelay > 0 && ipcDelay < 1000 ? newBaseMs + ipcDelay : newBaseMs;
-  if (Math.abs(compensated - playSeekMs.value) > SYNC_THRESHOLD) {
+  if (force || Math.abs(compensated - playSeekMs.value) > SYNC_THRESHOLD) {
     baseMs = compensated;
     anchorTick = performance.now();
+    playSeekMs.value = compensated;
   }
   if (!state.isPlaying) {
     baseMs = newBaseMs;
@@ -549,6 +607,7 @@ onMounted(async () => {
   disposeSnapshotListener =
     window.electron?.desktopLyric?.onSnapshot((next) => {
       snapshot.value = next;
+      // 每次收到 snapshot 都同步锚点，保持时间精度
       syncAnchor();
       // 按播放状态节能
       if (next.playback?.isPlaying) {
@@ -640,12 +699,7 @@ onBeforeUnmount(() => {
             <Icon :icon="iconChevronUpDown" width="18" height="18" />
           </button>
         </div>
-        <button
-          class="menu-btn lock-btn"
-          @mouseenter.stop="tempToggleLyricLock(false)"
-          @mouseleave.stop="tempToggleLyricLock(true)"
-          @click.stop="toggleLyricLock"
-        >
+        <button class="menu-btn lock-btn" @click.stop="toggleLyricLock">
           <Icon :icon="isLocked ? iconLockOpen : iconLock" width="20" height="20" />
         </button>
         <button class="menu-btn" @click.stop="closeWindow">
@@ -662,7 +716,7 @@ onBeforeUnmount(() => {
         fontSize: localFontSize + 'px',
         fontFamily,
         fontWeight,
-        textShadow: `0 0 4px ${shadowColor}`,
+        textShadow: `0 1px 2px rgba(0,0,0,0.2)`,
       }"
       :class="['lyric-container', alignment]"
     >
@@ -675,6 +729,7 @@ onBeforeUnmount(() => {
             active: line.active,
             'is-yrc': line.active && isYrcLine(line.line),
             'is-next': !line.active && doubleLine,
+            'is-hidden-next': !line.active && !doubleLine,
             'align-left': alignment === 'both' && line.index % 2 === 0,
             'align-right': alignment === 'both' && line.index % 2 !== 0,
           },
@@ -708,7 +763,7 @@ onBeforeUnmount(() => {
                     {
                       backgroundImage: `linear-gradient(to right, ${playedColor} 50%, ${unplayedColor} 50%)`,
                       textShadow: 'none',
-                      filter: `drop-shadow(0 0 1px ${shadowColor}) drop-shadow(0 0 2px ${shadowColor})`,
+                      filter: `drop-shadow(0 1px 1px rgba(0,0,0,0.2))`,
                     },
                     getYrcStyle(char, line.index),
                   ]"
@@ -731,6 +786,11 @@ onBeforeUnmount(() => {
       <!-- 占位 -->
       <span v-if="renderLyricLines.length === 0" class="lyric-line" key="placeholder">&nbsp;</span>
     </TransitionGroup>
+
+    <!-- 歌词同步警告 -->
+    <div v-if="lyricSyncWarning" class="sync-warning">
+      播放时长与原曲存在差异，歌词可能不同步，可能不是完整的音效/歌曲
+    </div>
   </div>
 </template>
 
@@ -910,6 +970,15 @@ onBeforeUnmount(() => {
   transform-origin: left center;
 }
 
+/* 单行模式：隐藏预渲染的下一句，不占视觉空间 */
+.lyric-line.is-hidden-next {
+  opacity: 0 !important;
+  height: 0 !important;
+  padding: 0 !important;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .scroll-content {
   display: inline-block;
   white-space: nowrap;
@@ -1033,6 +1102,18 @@ onBeforeUnmount(() => {
 .desktop-lyric.locked.hovered .lock-btn {
   opacity: 1;
   background-color: rgba(0, 0, 0, 0.45);
+}
+
+.sync-warning {
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: rgba(255, 200, 50, 0.85);
+  white-space: nowrap;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
 }
 </style>
 

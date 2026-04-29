@@ -153,6 +153,10 @@ const getSecondaryText = (line: LyricLine, mode: LyricsMode): string => {
 //   return 'none';
 // };
 
+// 页面歌词默认颜色
+export const DEFAULT_LYRIC_PLAYED_COLOR = '#31cfa1';
+export const DEFAULT_LYRIC_UNPLAYED_COLOR = '#ffffff';
+
 export const useLyricStore = defineStore('lyric', {
   state: () => ({
     lines: [] as LyricLine[],
@@ -161,6 +165,8 @@ export const useLyricStore = defineStore('lyric', {
     loadedHash: '',
     tips: '暂无歌词',
     isLoading: false,
+    // 歌词同步警告（实际播放时长与歌词时长差异过大时显示）
+    lyricSyncWarning: false,
     // 用户意图：是否想看翻译/音译（持久化，切歌不重置）
     wantTranslation: false,
     wantRomanization: false,
@@ -175,6 +181,9 @@ export const useLyricStore = defineStore('lyric', {
     detailResolved: false,
   }),
   getters: {
+    // 有效歌词颜色（用户自定义 > 默认值）
+    effectivePlayedColor: (state) => state.playedColor || DEFAULT_LYRIC_PLAYED_COLOR,
+    effectiveUnplayedColor: (state) => state.unplayedColor || DEFAULT_LYRIC_UNPLAYED_COLOR,
     // 兼容旧代码
     secondaryEnabled: (state) => state.wantTranslation || state.wantRomanization,
     canShowSecondary: (state) => state.hasTranslation || state.hasRomanization,
@@ -245,6 +254,7 @@ export const useLyricStore = defineStore('lyric', {
       this.loadedHash = payload?.hash ?? '';
       this.tips = payload?.tips ?? '暂无歌词';
       this.isLoading = false;
+      this.lyricSyncWarning = false;
       // 不重置 lyricsMode 和 secondaryEnabled，保留用户的翻译偏好
       this.hasTranslation = false;
       this.hasRomanization = false;
@@ -275,6 +285,9 @@ export const useLyricStore = defineStore('lyric', {
       this.resetLyricsState({ hash, tips: '暂无歌词' });
       const content = String(payload.decodeContent ?? payload.lyric ?? '')
         .replace(/^\uFEFF/, '')
+        .replace(/&apos;/g, "'")
+        .replace(/&quot;/g, '"')
+        .replace(/&amp;/g, '&')
         .trim();
       this.rawLyric = content;
       this.loadedHash = hash;
@@ -430,7 +443,7 @@ export const useLyricStore = defineStore('lyric', {
 
       this.tips = this.lines.length > 0 ? '歌词已加载' : '暂无歌词';
     },
-    updateCurrentIndex(currentTime: number) {
+    updateCurrentIndex(currentTime: number, isLyricViewOpen = false) {
       if (this.lines.length === 0) {
         this.currentIndex = -1;
         return;
@@ -460,17 +473,25 @@ export const useLyricStore = defineStore('lyric', {
       }
 
       if (this.currentIndex !== nextIndex) {
-        const previousLine = this.currentIndex >= 0 ? this.lines[this.currentIndex] : null;
-        previousLine?.characters.forEach((char) => {
-          char.highlighted = false;
-        });
+        // 逐字高亮状态只在歌词页打开时更新，避免无意义的响应式开销
+        if (isLyricViewOpen) {
+          const previousLine = this.currentIndex >= 0 ? this.lines[this.currentIndex] : null;
+          previousLine?.characters.forEach((char) => {
+            if (char.highlighted) char.highlighted = false;
+          });
+        }
         this.currentIndex = nextIndex;
       }
 
       if (this.currentIndex < 0) return;
+      // 逐字高亮只在歌词页打开时更新
+      if (!isLyricViewOpen) return;
       const currentLine = this.lines[this.currentIndex];
       currentLine.characters.forEach((char) => {
-        char.highlighted = currentTimeMs >= char.startTime;
+        const shouldHighlight = currentTimeMs >= char.startTime;
+        if (char.highlighted !== shouldHighlight) {
+          char.highlighted = shouldHighlight;
+        }
       });
     },
     async fetchLyrics(hash: string, options?: { preserveCurrent?: boolean }) {

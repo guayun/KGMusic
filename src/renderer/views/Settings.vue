@@ -3,7 +3,11 @@ import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { useSettingStore } from '@/stores/setting';
 import { useDesktopLyricStore } from '@/desktopLyric/store';
 import { usePlayerStore } from '@/stores/player';
-import { useLyricStore } from '@/stores/lyric';
+import {
+  useLyricStore,
+  DEFAULT_LYRIC_PLAYED_COLOR,
+  DEFAULT_LYRIC_UNPLAYED_COLOR,
+} from '@/stores/lyric';
 import { useToastStore } from '@/stores/toast';
 import type {
   AudioQualityValue,
@@ -21,9 +25,12 @@ import Switch from '@/components/ui/Switch.vue';
 import Dialog from '@/components/ui/Dialog.vue';
 import Button from '@/components/ui/Button.vue';
 import Scrollbar from '@/components/ui/Scrollbar.vue';
+import InputNumber from '@/components/ui/InputNumber.vue';
 import ColorPickerDialog from '@/components/ui/ColorPickerDialog.vue';
 import DisclaimerDialog from '@/components/app/DisclaimerDialog.vue';
 import UpdateDialog from '@/components/app/UpdateDialog.vue';
+import PageLyricIcon from '@/components/ui/PageLyricIcon.vue';
+
 import { marked } from 'marked';
 import { areShortcutLabelsEquivalent, formatShortcutLabelForDisplay } from '@/utils/shortcuts';
 import {
@@ -38,8 +45,8 @@ import {
   iconExternalLink,
   iconChevronRight,
   iconTypography,
-  iconLanguage,
 } from '@/icons';
+import FontIcon from '@/components/ui/FontIcon.vue';
 
 const settingStore = useSettingStore();
 const desktopLyricStore = useDesktopLyricStore();
@@ -47,7 +54,20 @@ const playerStore = usePlayerStore();
 const lyricStore = useLyricStore();
 const toastStore = useToastStore();
 const showDisclaimer = ref(false);
-const isRequestingOutputPermission = ref(false);
+
+// ── 页面缓存候选列表 ──
+const keepAliveOptions = [
+  { label: '为您推荐', value: 'home' },
+  { label: '每日推荐', value: 'recommend-songs' },
+  { label: '排行榜', value: 'ranking' },
+  { label: '探索发现', value: 'explore' },
+  { label: '搜索', value: 'search-page' },
+  { label: '我的云盘', value: 'cloud' },
+  { label: '我最喜爱', value: 'favorites' },
+  { label: '歌单详情', value: 'playlist-detail' },
+  { label: '歌手详情', value: 'artist-detail' },
+  { label: '专辑详情', value: 'album-detail' },
+];
 const activeDesktopLyricColorField = ref<'playedColor' | 'unplayedColor' | null>(null);
 
 // ── 页面歌词颜色选择器 ──
@@ -69,10 +89,13 @@ const lyricColorPresets = [
 ];
 
 const activeLyricColorValue = computed(() => {
-  if (!activeLyricColorField.value) return '#0071e3';
-  const stored = lyricStore[activeLyricColorField.value];
-  if (stored) return stored;
-  return activeLyricColorField.value === 'playedColor' ? '#0071e3' : '#8a8a8a';
+  if (!activeLyricColorField.value) return DEFAULT_LYRIC_PLAYED_COLOR;
+  return (
+    lyricStore[activeLyricColorField.value] ||
+    (activeLyricColorField.value === 'playedColor'
+      ? DEFAULT_LYRIC_PLAYED_COLOR
+      : DEFAULT_LYRIC_UNPLAYED_COLOR)
+  );
 });
 
 const openLyricColorPicker = (field: 'playedColor' | 'unplayedColor') => {
@@ -132,11 +155,43 @@ const applyDesktopLyricColor = async (value: string) => {
   });
   closeDesktopLyricColorPicker();
 };
+// ── 系统字体列表 ──
+const systemFontOptions = ref<{ label: string; value: string }[]>([]);
+const globalFontOptions = computed(() => [
+  { label: '系统默认', value: 'system-ui' },
+  ...systemFontOptions.value,
+]);
+const lyricFontOptions = computed(() => [
+  { label: '跟随全局', value: 'follow' },
+  { label: '系统默认', value: 'system-ui' },
+  ...systemFontOptions.value,
+]);
+
+const fetchSystemFonts = async () => {
+  const fonts = await settingStore.fetchSystemFonts();
+  // 短名优先排序
+  const sorted = fonts.slice().sort((a, b) => {
+    if (a === b) return 0;
+    if (a.startsWith(b)) return 1;
+    if (b.startsWith(a)) return -1;
+    return a.localeCompare(b);
+  });
+  systemFontOptions.value = sorted.map((name) => ({ label: name, value: name }));
+};
+
+// 桌面歌词字体名
+const desktopLyricFontName = computed(() => desktopLyricStore.settings.fontFamily || 'follow');
+
+const applyDesktopLyricFont = (fontName: string) => {
+  void commitDesktopLyricSettings({ fontFamily: fontName || 'follow' });
+};
+
 onMounted(() => {
   settingStore.syncCloseBehavior();
   settingStore.syncTheme();
   void settingStore.hydrateAppInfo();
   void desktopLyricStore.hydrate();
+  void fetchSystemFonts();
 });
 
 const desktopLyricAlignOptions = [
@@ -180,6 +235,16 @@ const isMac = computed(() => window.electron?.platform === 'darwin');
 const recording = ref<ShortcutRecordingState | null>(null);
 let removeRecorder: (() => void) | null = null;
 let removeOutside: (() => void) | null = null;
+
+const handleVolumeNormalizationChange = (enabled: boolean) => {
+  settingStore.volumeNormalization = enabled;
+  playerStore.setVolumeNormalization(enabled);
+};
+
+const handleReferenceLufsSlider = (value: number) => {
+  settingStore.volumeNormalizationLufs = value;
+  playerStore.setReferenceLufs(value);
+};
 
 const autoNextDelayInput = computed({
   get: () => String(settingStore.autoNextDelaySeconds ?? 0),
@@ -391,47 +456,21 @@ const outputDeviceDisconnectBehaviorOptions = [
 ];
 
 const outputDeviceOptions = computed(() => settingStore.outputDevices);
-const selectedOutputDeviceLabel = computed(() => {
-  const matched = settingStore.outputDevices.find(
-    (item) => item.value === settingStore.outputDevice,
-  );
-  return matched?.label || (settingStore.outputDevice === 'default' ? '系统默认' : '未识别设备');
-});
-const appliedOutputDeviceLabel = computed(() => {
+
+const currentOutputDeviceLabel = computed(() => {
   const matched = settingStore.outputDevices.find(
     (item) => item.value === playerStore.appliedOutputDeviceId,
   );
   return (
-    matched?.label || (playerStore.appliedOutputDeviceId === 'default' ? '系统默认' : '未识别设备')
+    matched?.label || (playerStore.appliedOutputDeviceId === 'default' ? '系统默认' : '未知设备')
   );
 });
-const isOutputDeviceTemporarilyFellBack = computed(
-  () => playerStore.appliedOutputDeviceId === 'default' && settingStore.outputDevice !== 'default',
-);
-const outputDeviceFeedbackTone = computed(() => {
-  if (settingStore.outputDeviceStatus === 'error') return 'danger';
-  if (
-    settingStore.outputDeviceStatus === 'unsupported' ||
-    settingStore.outputDeviceStatus === 'permission' ||
-    settingStore.outputDeviceStatus === 'fallback'
-  )
-    return 'warning';
-  return 'info';
-});
-const hasOutputDeviceFeedback = computed(
-  () => settingStore.outputDeviceStatus !== 'idle' && !!settingStore.outputDeviceStatusMessage,
-);
-const canRequestOutputDevicePermission = computed(() => {
-  const status = settingStore.outputDeviceStatus;
-  return (
-    typeof navigator.mediaDevices?.getUserMedia === 'function' &&
-    (status === 'permission' || status === 'error')
-  );
-});
-const outputDevicePermissionActionLabel = computed(() => {
-  if (isRequestingOutputPermission.value) return '请求中...';
-  return settingStore.outputDeviceStatus === 'error' ? '重新获取设备' : '授权音频设备';
-});
+
+const handleOutputDeviceChange = async (value: string | number | boolean | null | undefined) => {
+  const nextValue = String(value ?? 'default');
+  if (nextValue === settingStore.outputDevice) return;
+  settingStore.outputDevice = nextValue;
+};
 
 const versionLabel = computed(() => settingStore.appVersion || '未知');
 const releaseChannelLabel = computed(() => (settingStore.isPrerelease ? 'Prerelease' : 'Release'));
@@ -452,38 +491,6 @@ const handleShowChangelog = async () => {
     changelogHtml.value = '<p>无法读取更新日志</p>';
   }
   showChangelog.value = true;
-};
-
-const handleRequestOutputDevicePermission = async () => {
-  if (isRequestingOutputPermission.value) return;
-  isRequestingOutputPermission.value = true;
-  try {
-    await playerStore.requestOutputDevicePermission(settingStore);
-  } finally {
-    isRequestingOutputPermission.value = false;
-  }
-};
-
-const handleOutputDeviceChange = async (value: string | number | boolean | null | undefined) => {
-  const nextValue = String(value ?? 'default');
-  if (nextValue === settingStore.outputDevice) return;
-
-  if (
-    nextValue !== 'default' &&
-    settingStore.outputDeviceStatus === 'permission' &&
-    typeof navigator.mediaDevices?.getUserMedia === 'function'
-  ) {
-    if (isRequestingOutputPermission.value) return;
-    isRequestingOutputPermission.value = true;
-    try {
-      const granted = await playerStore.requestOutputDevicePermission(settingStore);
-      if (!granted) return;
-    } finally {
-      isRequestingOutputPermission.value = false;
-    }
-  }
-
-  settingStore.outputDevice = nextValue;
 };
 
 const handleUpdateCheckResult = (payload: unknown) => {
@@ -541,7 +548,7 @@ onUnmounted(() => {
             <p class="text-sm text-text-secondary">选择您喜欢的主题外观</p>
           </div>
           <Select
-            class="min-w-[180px]"
+            class="w-[180px]"
             :model-value="settingStore.theme"
             :options="themeOptions"
             @update:model-value="settingStore.setTheme($event as ThemeMode)"
@@ -578,7 +585,7 @@ onUnmounted(() => {
             <p class="text-sm text-text-secondary">点击窗口关闭按钮时的应用行为</p>
           </div>
           <Select
-            class="min-w-[180px]"
+            class="w-[180px]"
             :model-value="settingStore.closeBehavior"
             :options="closeBehaviorOptions"
             @update:model-value="
@@ -586,6 +593,88 @@ onUnmounted(() => {
               settingStore.syncCloseBehavior();
             "
           />
+        </div>
+      </div>
+    </section>
+
+    <section class="space-y-6">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
+          <FontIcon :size="18" />
+        </div>
+        <h2 class="text-lg font-bold">字体设置</h2>
+      </div>
+      <div class="settings-card">
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">全局字体</h3>
+            <p class="text-sm text-text-secondary">应用到软件内所有区域的字体</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="settingStore.globalFont !== 'system-ui'"
+              type="button"
+              class="text-[11px] font-semibold text-text-secondary hover:text-text-main transition-colors whitespace-nowrap"
+              @click="settingStore.globalFont = 'system-ui'"
+            >
+              重置
+            </button>
+            <Select
+              filterable
+              class="w-[180px]"
+              :model-value="settingStore.globalFont"
+              :options="globalFontOptions"
+              @update:model-value="settingStore.globalFont = String($event)"
+            />
+          </div>
+        </div>
+        <div class="settings-divider"></div>
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">页面歌词字体</h3>
+            <p class="text-sm text-text-secondary">歌词页面使用的字体，跟随全局或单独指定</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="settingStore.lyricFont !== 'follow'"
+              type="button"
+              class="text-[11px] font-semibold text-text-secondary hover:text-text-main transition-colors whitespace-nowrap"
+              @click="settingStore.lyricFont = 'follow'"
+            >
+              重置
+            </button>
+            <Select
+              filterable
+              class="w-[180px]"
+              :model-value="settingStore.lyricFont"
+              :options="lyricFontOptions"
+              @update:model-value="settingStore.lyricFont = String($event)"
+            />
+          </div>
+        </div>
+        <div class="settings-divider"></div>
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">桌面歌词字体</h3>
+            <p class="text-sm text-text-secondary">桌面歌词窗口使用的字体，跟随全局或单独指定</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="desktopLyricFontName !== 'follow'"
+              type="button"
+              class="text-[11px] font-semibold text-text-secondary hover:text-text-main transition-colors whitespace-nowrap"
+              @click="applyDesktopLyricFont('follow')"
+            >
+              重置
+            </button>
+            <Select
+              filterable
+              class="w-[180px]"
+              :model-value="desktopLyricFontName"
+              :options="lyricFontOptions"
+              @update:model-value="applyDesktopLyricFont(String($event))"
+            />
+          </div>
         </div>
       </div>
     </section>
@@ -633,6 +722,34 @@ onUnmounted(() => {
         <div class="settings-divider"></div>
         <div class="settings-item">
           <div class="space-y-1">
+            <h3 class="font-semibold">音量均衡</h3>
+            <p class="text-sm text-text-secondary">自动调整不同歌曲的音量，使播放响度保持一致</p>
+          </div>
+          <Switch
+            :model-value="settingStore.volumeNormalization"
+            @update:model-value="handleVolumeNormalizationChange"
+          />
+        </div>
+        <div v-if="settingStore.volumeNormalization" class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">参考响度</h3>
+            <p class="text-sm text-text-secondary">数值越高整体音量越大，越低越安静</p>
+          </div>
+          <Slider
+            class="w-48"
+            :model-value="settingStore.volumeNormalizationLufs"
+            :min="-20"
+            :max="-8"
+            :step="1"
+            show-value
+            :value-suffix="' LUFS'"
+            @update:model-value="handleReferenceLufsSlider($event)"
+            @value-commit="handleReferenceLufsSlider($event)"
+          />
+        </div>
+        <div class="settings-divider"></div>
+        <div class="settings-item">
+          <div class="space-y-1">
             <h3 class="font-semibold">自动跳过错误</h3>
             <p class="text-sm text-text-secondary">
               播放失败时停留在当前歌曲，并按设定延迟自动尝试下一首
@@ -645,36 +762,53 @@ onUnmounted(() => {
             <h3 class="font-semibold">失败后切换延迟</h3>
             <p class="text-sm text-text-secondary">给用户留出确认失败状态的时间，再自动切换</p>
           </div>
-          <div class="flex items-center gap-3">
-            <input
-              v-model="autoNextDelayInput"
-              type="number"
-              min="0"
-              max="600"
-              step="1"
-              placeholder="0"
-              class="settings-number-input"
-            />
-            <span class="text-sm text-text-secondary">秒</span>
-          </div>
+          <InputNumber
+            class="w-[180px]"
+            :model-value="autoNextDelayInput"
+            :min="0"
+            :max="600"
+            :step="1"
+            placeholder="0"
+            suffix="秒"
+            @update:model-value="autoNextDelayInput = $event"
+          />
         </div>
         <div v-if="settingStore.autoNext" class="settings-item">
           <div class="space-y-1">
             <h3 class="font-semibold">最大自动切换次数</h3>
             <p class="text-sm text-text-secondary">连续失败时最多自动尝试的次数，避免无限跳歌</p>
           </div>
-          <div class="flex items-center gap-3">
-            <input
-              v-model="autoNextMaxAttemptsInput"
-              type="number"
-              min="1"
-              max="999"
-              step="1"
-              placeholder="10"
-              class="settings-number-input"
-            />
-            <span class="text-sm text-text-secondary">次</span>
+          <InputNumber
+            class="w-[180px]"
+            :model-value="autoNextMaxAttemptsInput"
+            :min="1"
+            :max="999"
+            :step="1"
+            placeholder="10"
+            suffix="次"
+            @update:model-value="autoNextMaxAttemptsInput = $event"
+          />
+        </div>
+        <div class="settings-divider"></div>
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">播放恢复超时</h3>
+            <p class="text-sm text-text-secondary">
+              长时间暂停后恢复播放可能卡住，超时后自动重新加载音频源。设为 0 禁用
+            </p>
           </div>
+          <InputNumber
+            class="w-[180px]"
+            :model-value="String(settingStore.playResumeTimeout ?? 5)"
+            :min="0"
+            :max="30"
+            :step="1"
+            placeholder="5"
+            suffix="秒"
+            @update:model-value="
+              settingStore.playResumeTimeout = Math.max(0, Math.min(30, Number($event) || 0))
+            "
+          />
         </div>
         <div class="settings-divider"></div>
         <div class="settings-item">
@@ -703,7 +837,7 @@ onUnmounted(() => {
             </p>
           </div>
           <Select
-            class="min-w-[180px]"
+            class="w-[180px]"
             :model-value="settingStore.defaultAudioQuality"
             :options="audioQualityOptions"
             @update:model-value="settingStore.defaultAudioQuality = $event as AudioQualityValue"
@@ -723,7 +857,7 @@ onUnmounted(() => {
     <section class="space-y-6">
       <div class="flex items-center gap-3">
         <div class="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
-          <Icon :icon="iconLanguage" width="18" height="18" />
+          <PageLyricIcon :size="18" />
         </div>
         <h2 class="text-lg font-bold">页面歌词</h2>
       </div>
@@ -791,7 +925,7 @@ onUnmounted(() => {
               <button
                 type="button"
                 class="settings-color-swatch"
-                :style="{ backgroundColor: lyricStore.playedColor || 'var(--color-primary)' }"
+                :style="{ backgroundColor: lyricStore.effectivePlayedColor }"
                 @click="openLyricColorPicker('playedColor')"
               ></button>
             </div>
@@ -800,7 +934,7 @@ onUnmounted(() => {
               <button
                 type="button"
                 class="settings-color-swatch"
-                :style="{ backgroundColor: lyricStore.unplayedColor || 'rgba(15,23,42,0.84)' }"
+                :style="{ backgroundColor: lyricStore.effectiveUnplayedColor }"
                 @click="openLyricColorPicker('unplayedColor')"
               ></button>
             </div>
@@ -869,13 +1003,47 @@ onUnmounted(() => {
             @value-commit="settingStore.lyricCarouselInterval = $event"
           />
         </div>
+        <div v-if="settingStore.lyricArtistBackdrop" class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">歌词自动收起</h3>
+            <p class="text-sm text-text-secondary">写真模式下无操作后歌词自动收起到底部两行</p>
+          </div>
+          <Switch v-model="settingStore.lyricAutoCollapseEnabled" />
+        </div>
+        <div
+          v-if="settingStore.lyricArtistBackdrop && settingStore.lyricAutoCollapseEnabled"
+          class="settings-item"
+        >
+          <div class="space-y-1">
+            <h3 class="font-semibold">收起延迟</h3>
+            <p class="text-sm text-text-secondary">无操作后等待多久自动收起</p>
+          </div>
+          <Slider
+            class="w-48"
+            :model-value="settingStore.lyricAutoCollapseDelay"
+            :min="5"
+            :max="60"
+            :step="1"
+            show-value
+            :value-suffix="'s'"
+            @update:model-value="settingStore.lyricAutoCollapseDelay = $event"
+            @value-commit="settingStore.lyricAutoCollapseDelay = $event"
+          />
+        </div>
+        <div v-if="settingStore.lyricArtistBackdrop" class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">写真模式颜色自适应</h3>
+            <p class="text-sm text-text-secondary">根据写真背景亮度自动切换按钮和控件的深浅配色</p>
+          </div>
+          <Switch v-model="settingStore.lyricAdaptiveColor" />
+        </div>
       </div>
     </section>
 
     <section class="space-y-6">
       <div class="flex items-center gap-3">
         <div class="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
-          <Icon :icon="iconTypography" width="18" height="18" />
+          <Icon :icon="iconTypography" :width="18" :height="18" />
         </div>
         <h2 class="text-lg font-bold">桌面歌词</h2>
       </div>
@@ -932,7 +1100,7 @@ onUnmounted(() => {
             <p class="text-sm text-text-secondary">歌词文字的排版位置</p>
           </div>
           <Select
-            class="min-w-[120px]"
+            class="w-[180px]"
             :model-value="desktopLyricStore.settings.alignment"
             :options="desktopLyricAlignOptions"
             @update:model-value="commitDesktopLyricSettings({ alignment: $event as any })"
@@ -1078,54 +1246,41 @@ onUnmounted(() => {
           <div class="space-y-1">
             <h3 class="font-semibold">输出设备</h3>
             <p class="text-sm text-text-secondary">选择音频播放输出设备</p>
-            <p class="text-xs text-text-secondary/80">
-              首选输出：{{ selectedOutputDeviceLabel }}
-              <span v-if="isOutputDeviceTemporarilyFellBack">
-                · 当前实际输出：{{ appliedOutputDeviceLabel }}</span
-              >
-            </p>
+            <p class="text-xs text-text-secondary/80">当前使用：{{ currentOutputDeviceLabel }}</p>
           </div>
           <Select
-            class="min-w-[180px]"
+            class="w-[180px]"
             :model-value="settingStore.outputDevice"
             :options="outputDeviceOptions"
-            @update:model-value="handleOutputDeviceChange"
+            @update:model-value="handleOutputDeviceChange($event as string)"
           />
+        </div>
+        <div class="settings-divider"></div>
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">独占音频设备</h3>
+            <p class="text-sm text-text-secondary">
+              绕过系统混音器直接输出，可获得更高音质，但开启后其他应用将无法播放声音
+            </p>
+          </div>
+          <Switch v-model="settingStore.exclusiveAudioDevice" />
         </div>
         <div class="settings-divider"></div>
         <div class="settings-item">
           <div class="space-y-1">
             <h3 class="font-semibold">设备断开后的行为</h3>
             <p class="text-sm text-text-secondary">
-              当当前所选输出设备断开时，选择暂停播放或临时切换到系统默认设备
+              当前所选输出设备断开时，选择暂停播放或临时切换到系统默认设备
             </p>
           </div>
           <Select
-            class="min-w-[180px]"
+            class="w-[180px]"
             :model-value="settingStore.outputDeviceDisconnectBehavior"
             :options="outputDeviceDisconnectBehaviorOptions"
             @update:model-value="
               settingStore.outputDeviceDisconnectBehavior = $event as OutputDeviceDisconnectBehavior
             "
           />
-        </div>
-        <div
-          v-if="hasOutputDeviceFeedback"
-          :class="['settings-warning', `is-${outputDeviceFeedbackTone}`]"
-        >
-          <div class="settings-warning-content">
-            <span>{{ settingStore.outputDeviceStatusMessage }}</span>
-            <Button
-              v-if="canRequestOutputDevicePermission"
-              variant="outline"
-              size="xs"
-              class="settings-button"
-              :disabled="isRequestingOutputPermission"
-              @click="handleRequestOutputDevicePermission"
-            >
-              {{ outputDevicePermissionActionLabel }}
-            </Button>
-          </div>
         </div>
       </div>
     </section>
@@ -1141,9 +1296,79 @@ onUnmounted(() => {
         <div class="settings-item">
           <div class="space-y-1">
             <h3 class="font-semibold">自动领取 VIP</h3>
-            <p class="text-sm text-text-secondary">每次启动自动领取每日 VIP (需要登录)</p>
+            <p class="text-sm text-text-secondary">每次启动自动领取每日 VIP</p>
           </div>
           <Switch v-model="settingStore.autoReceiveVip" />
+        </div>
+        <div class="settings-divider"></div>
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">页面缓存</h3>
+            <p class="text-sm text-text-secondary">
+              缓存已访问的页面，返回时无需重新加载，关闭后所有页面不缓存
+            </p>
+          </div>
+          <Switch v-model="settingStore.keepAliveEnabled" />
+        </div>
+        <template v-if="settingStore.keepAliveEnabled">
+          <div class="settings-divider"></div>
+          <div class="settings-item">
+            <div class="space-y-1">
+              <h3 class="font-semibold">缓存页面</h3>
+              <p class="text-sm text-text-secondary">选择需要缓存的页面</p>
+            </div>
+            <Select
+              multiple
+              class="w-[180px]"
+              :model-value="settingStore.keepAliveRoutes"
+              :options="keepAliveOptions"
+              placeholder="选择页面"
+              @update:model-value="settingStore.keepAliveRoutes = $event as string[]"
+            />
+          </div>
+          <div class="settings-divider"></div>
+          <div class="settings-item">
+            <div class="space-y-1">
+              <h3 class="font-semibold">最大缓存页面数</h3>
+              <p class="text-sm text-text-secondary">
+                超出后自动释放最早缓存的页面，避免占用过多内存
+              </p>
+            </div>
+            <InputNumber
+              class="w-[180px]"
+              :model-value="String(settingStore.keepAliveMax)"
+              :min="3"
+              :max="30"
+              :step="1"
+              placeholder="20"
+              @update:model-value="
+                (val) => {
+                  const parsed = Number.parseInt(String(val), 10);
+                  settingStore.keepAliveMax = Number.isNaN(parsed)
+                    ? 20
+                    : Math.max(3, Math.min(parsed, 30));
+                }
+              "
+            />
+          </div>
+        </template>
+        <div class="settings-divider"></div>
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">禁用 GPU 加速</h3>
+            <p class="text-sm text-text-secondary">
+              遇到界面花屏等渲染异常时可尝试开启，重启后生效
+            </p>
+          </div>
+          <Switch
+            :model-value="settingStore.disableGpuAcceleration"
+            @update:model-value="
+              (v: boolean) => {
+                settingStore.disableGpuAcceleration = v;
+                settingStore.syncDisableGpuAcceleration();
+              }
+            "
+          />
         </div>
       </div>
     </section>
@@ -1194,6 +1419,14 @@ onUnmounted(() => {
         <h2 class="text-lg font-bold">关于 EchoMusic</h2>
       </div>
       <div class="settings-card">
+        <div class="settings-item">
+          <div class="space-y-1">
+            <h3 class="font-semibold">自动检查更新</h3>
+            <p class="text-sm text-text-secondary">启动时自动检查是否有新版本</p>
+          </div>
+          <Switch v-model="settingStore.autoCheckUpdate" />
+        </div>
+        <div class="settings-divider"></div>
         <div class="settings-item">
           <div class="space-y-1">
             <h3 class="font-semibold">检查预发布版本</h3>
@@ -1336,20 +1569,6 @@ onUnmounted(() => {
 
 .settings-select {
   @apply bg-bg-main text-text-main border border-border-light rounded-lg px-3 py-1.5 text-sm font-semibold focus:outline-none min-w-[160px];
-}
-
-.settings-number-input {
-  width: 120px;
-  height: 40px;
-  padding: 0 6px 0 14px;
-  border-radius: 12px;
-  border: 1px solid color-mix(in srgb, var(--color-border-light) 92%, transparent);
-  background: color-mix(in srgb, var(--color-text-main) 4%, transparent);
-  color: var(--color-text-main);
-  color-scheme: light;
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 40px;
 }
 
 .settings-text-input {

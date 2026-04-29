@@ -1,10 +1,14 @@
 import { app, BrowserWindow, globalShortcut } from 'electron';
 import { initLogger } from './logger';
+import log from './logger';
 import { initApiServer } from './server';
 import { registerIpcHandlers } from './ipc';
 import { createWindow, getMainWindow, restoreWindow, showMainWindow } from './window';
 import { createDockMenu, destroyTray, initTray, refreshTray } from './tray';
 import { getDesktopLyricWindow } from './desktopLyric';
+import { initMpvPlayer, destroyMpvPlayer } from './mpv';
+import { registerPlayerIpc } from './ipc/player';
+import { initMediaControls, destroyMediaControls } from './mediaControls';
 
 const WM_TASKBARCREATED = 0x031a;
 
@@ -34,7 +38,7 @@ if (!gotTheLock) {
     restoreWindow();
   });
 
-  // 注册 IPC 处理器
+  // IPC handler 必须在窗口创建前注册
   registerIpcHandlers({
     getMainWindow,
   });
@@ -45,15 +49,40 @@ if (!gotTheLock) {
       restoreWindow,
     };
 
-    await initApiServer().catch((err) => {
-      console.error('[Main] Failed to init API server:', err);
+    // --- Loading 阶段：在窗口创建前完成核心服务初始化 ---
+
+    // 注册播放器 IPC（渲染进程启动后立即可用）
+    const mpvRef: { current: import('./mpv/controller').MpvController | null } = { current: null };
+    registerPlayerIpc(mpvRef);
+
+    // 并行初始化 API 服务器和 mpv 播放引擎
+    const [, mpvInstance] = await Promise.all([
+      initApiServer().catch((err) => {
+        log.error('[Main] Failed to init API server:', err);
+      }),
+      initMpvPlayer(getMainWindow).catch((err) => {
+        log.error('[Main] Failed to init mpv player:', err);
+        return null;
+      }),
+    ]);
+
+    mpvRef.current = mpvInstance ?? null;
+    log.info('[Main] Pre-window initialization complete', {
+      mpvAvailable: !!mpvRef.current,
+      platform: process.platform,
+      arch: process.arch,
     });
 
+    // 初始化原生媒体控制（SMTC / MPNowPlaying / MPRIS）
+    initMediaControls(getMainWindow);
+
+    // --- 创建主窗口 ---
     await createWindow();
+
     try {
       initTray(trayContext);
     } catch (err) {
-      console.error('[Main] Failed to init tray:', err);
+      log.error('[Main] Failed to init tray:', err);
     }
     installWindowsTrayRecovery();
 
@@ -85,9 +114,11 @@ if (!gotTheLock) {
     if (isExiting) return;
     isExiting = true;
     event.preventDefault();
-    console.log('[Main] before-quit: cleaning up and exiting...');
+    log.info('[Main] before-quit: cleaning up and exiting');
     globalShortcut.unregisterAll();
     destroyTray();
+    destroyMediaControls();
+    destroyMpvPlayer();
     // 销毁桌面歌词窗口
     try {
       const lyricWin = getDesktopLyricWindow();

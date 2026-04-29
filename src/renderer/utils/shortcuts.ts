@@ -4,8 +4,6 @@ import { useSettingStore } from '@/stores/setting';
 import { useDesktopLyricStore } from '@/desktopLyric/store';
 import { useLyricStore } from '@/stores/lyric';
 import { useToastStore } from '@/stores/toast';
-import router from '@/router';
-import { closeTransientView } from '@/utils/navigation';
 import type {
   ShortcutCommand,
   ShortcutMap,
@@ -285,15 +283,7 @@ export const executeShortcutCommand = (command: ShortcutCommand) => {
   } else if (command === 'nextTrack') {
     playerStore.next();
   } else if (command === 'toggleMainLyric') {
-    const currentRoute = router.currentRoute.value;
-    if (currentRoute.name === 'lyric') {
-      void closeTransientView(router, currentRoute);
-      return;
-    }
-    router.push({
-      name: 'lyric',
-      query: { from: currentRoute.fullPath },
-    });
+    playerStore.toggleLyricView();
   } else if (command === 'toggleDesktopLyric') {
     void desktopLyricStore.setEnabled(!desktopLyricStore.settings.enabled);
   } else if (command === 'toggleLyricsMode') {

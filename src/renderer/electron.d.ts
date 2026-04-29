@@ -7,6 +7,7 @@ import type {
   DesktopLyricSnapshot,
   DesktopLyricSnapshotPatch,
 } from '../shared/desktop-lyric';
+import type { RecognizeResponse } from '../shared/shazam';
 
 export interface IElectronAPI {
   platform: string;
@@ -24,10 +25,13 @@ export interface IElectronAPI {
     refresh: () => Promise<ShortcutRegistrationResult>;
     onTrigger: (func: (command: string) => void) => () => void;
   };
-  windowControl: (action: 'minimize' | 'maximize' | 'close') => void;
+  windowControl: (action: 'minimize' | 'maximize' | 'close' | 'fullscreen') => void;
   appInfo: {
     get: () => Promise<AppInfoResult>;
     getChangelog: () => Promise<string>;
+  };
+  fonts: {
+    getAll: () => Promise<string[]>;
   };
   updater: {
     download: () => void;
@@ -51,6 +55,7 @@ export interface IElectronAPI {
       cookie?: string[];
       headers?: Record<string, string>;
     }>;
+    clearCache: () => Promise<{ success: boolean }>;
   };
   tray: {
     syncPlayback: (payload: { isPlaying?: boolean; playMode?: PlayMode; volume?: number }) => void;
@@ -80,6 +85,65 @@ export interface IElectronAPI {
     error: (...args: unknown[]) => void;
     debug: (...args: unknown[]) => void;
     verbose: (...args: unknown[]) => void;
+  };
+  shazam: {
+    recognize: (pcmData: ArrayBuffer) => Promise<RecognizeResponse>;
+    enableLoopback: () => Promise<void>;
+    disableLoopback: () => Promise<void>;
+  };
+  mediaControls: {
+    updateMetadata: (payload: {
+      title: string;
+      artist: string;
+      album: string;
+      coverUrl?: string;
+      durationMs?: number;
+    }) => Promise<void>;
+    updateState: (payload: { status: string }) => Promise<void>;
+    updateTimeline: (payload: { currentTimeMs: number; totalTimeMs: number }) => Promise<void>;
+    available: () => Promise<boolean>;
+    onEvent: (func: (event: { type: string; positionMs?: number }) => void) => () => void;
+  };
+  mpv: {
+    load: (url: string) => Promise<void>;
+    loadMkvTrack: (url: string, trackId: number) => Promise<void>;
+    getTrackList: () => Promise<
+      Array<{ id: number; type: string; codec: string; title?: string; lang?: string }>
+    >;
+    play: () => Promise<void>;
+    pause: () => Promise<void>;
+    stop: () => Promise<void>;
+    seek: (time: number) => Promise<void>;
+    setVolume: (volume: number) => Promise<void>;
+    setSpeed: (speed: number) => Promise<void>;
+    setAudioDevice: (deviceName: string) => Promise<void>;
+    getAudioDevices: () => Promise<Array<{ name: string; description: string }>>;
+    setNormalizationGain: (gainDb: number) => Promise<void>;
+    fade: (from: number, to: number, durationMs: number) => Promise<void>;
+    cancelFade: () => Promise<void>;
+    pauseWithFade: (savedVolume: number, durationMs: number) => Promise<void>;
+    playWithFade: (targetVolume: number, durationMs: number) => Promise<void>;
+    getState: () => Promise<{
+      playing: boolean;
+      paused: boolean;
+      duration: number;
+      timePos: number;
+      volume: number;
+      speed: number;
+      idle: boolean;
+      path: string;
+      audioDevice: string;
+    } | null>;
+    available: () => Promise<boolean>;
+    restart: () => Promise<boolean>;
+    setExclusive: (exclusive: boolean) => Promise<boolean>;
+    setMediaTitle: (title: string) => Promise<void>;
+    setLoopFile: (loop: boolean) => Promise<void>;
+    onTimeUpdate: (func: (time: number) => void) => () => void;
+    onDurationChange: (func: (duration: number) => void) => () => void;
+    onStateChange: (func: (state: { playing?: boolean; paused?: boolean }) => void) => () => void;
+    onPlaybackEnd: (func: (reason: string) => void) => () => void;
+    onError: (func: (message: string) => void) => () => void;
   };
 }
 

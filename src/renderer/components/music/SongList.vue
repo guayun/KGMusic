@@ -33,6 +33,8 @@ interface Props {
   active?: boolean;
   queueOptions?: SetPlaybackQueueOptions;
   queueFilteredInvalidCount?: number;
+  showLyricColumn?: boolean;
+  stickySelector?: string;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -49,6 +51,8 @@ const props = withDefaults(defineProps<Props>(), {
   itemKeyField: 'id',
   active: true,
   queueFilteredInvalidCount: 0,
+  showLyricColumn: false,
+  stickySelector: '',
 });
 
 // const emit = defineEmits<{
@@ -75,7 +79,6 @@ const filteredSongs = computed(() => {
 const itemHeight = 60;
 const overscan = 10;
 const containerRef = ref<HTMLElement | null>(null);
-const scrollContainerRef = ref<HTMLElement | null>(null);
 const visibleStart = ref(0);
 const visibleEnd = ref(0);
 let measureFrame = 0;
@@ -104,6 +107,7 @@ const rowGridTemplate = computed(() =>
     showIndex: props.showIndex,
     showAlbum: props.showAlbum,
     showDuration: props.showDuration,
+    lyricColumn: props.showLyricColumn,
   }),
 );
 
@@ -178,7 +182,7 @@ const updateVisibleRange = () => {
     return;
   }
 
-  const scrollContainer = scrollContainerRef.value ?? getScrollContainer();
+  const scrollContainer = getScrollContainer();
   const containerEl = containerRef.value;
 
   if (!scrollContainer || !containerEl) {
@@ -221,18 +225,20 @@ const handleScroll = () => {
   scheduleMeasure();
 };
 
+let boundContainer: HTMLElement | null = null;
+
 const bindScrollContainer = () => {
   const nextContainer = getScrollContainer();
-  if (scrollContainerRef.value === nextContainer) return;
-  if (scrollContainerRef.value) {
-    scrollContainerRef.value.removeEventListener('scroll', handleScroll);
+  if (boundContainer === nextContainer) return;
+  if (boundContainer) {
+    boundContainer.removeEventListener('scroll', handleScroll);
   }
-  scrollContainerRef.value = nextContainer;
-  scrollContainerRef.value?.addEventListener('scroll', handleScroll, { passive: true });
+  boundContainer = nextContainer;
+  boundContainer?.addEventListener('scroll', handleScroll, { passive: true });
 };
 
 const scrollToIndex = (index: number, behavior: ScrollBehavior = 'auto') => {
-  const scrollContainer = scrollContainerRef.value ?? getScrollContainer();
+  const scrollContainer = getScrollContainer();
   const containerEl = containerRef.value;
   if (!scrollContainer || !containerEl) return;
 
@@ -246,9 +252,9 @@ const scrollToIndex = (index: number, behavior: ScrollBehavior = 'auto') => {
 
 const getStickyOffset = (scrollContainer: HTMLElement): number => {
   const containerTop = scrollContainer.getBoundingClientRect().top;
-  const stickyNodes = Array.from(
-    scrollContainer.querySelectorAll<HTMLElement>('.sliver-header-root, .song-list-sticky'),
-  );
+  const baseSelector = '.sliver-header-root, .song-list-sticky';
+  const selector = props.stickySelector ? `${baseSelector}, ${props.stickySelector}` : baseSelector;
+  const stickyNodes = Array.from(scrollContainer.querySelectorAll<HTMLElement>(selector));
   if (stickyNodes.length === 0) return 0;
   const bottoms = stickyNodes
     .map((node) => node.getBoundingClientRect().bottom - containerTop)
@@ -359,7 +365,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (measureFrame) cancelAnimationFrame(measureFrame);
   window.removeEventListener('resize', scheduleMeasure);
-  scrollContainerRef.value?.removeEventListener('scroll', handleScroll);
+  boundContainer?.removeEventListener('scroll', handleScroll);
 });
 
 useResizeObserver(containerRef, () => {
@@ -469,7 +475,7 @@ defineExpose({ scrollToActive, filteredCount: computed(() => filteredSongs.value
             </div>
 
             <Button
-              v-if="showAlbum"
+              v-if="showAlbum && !showLyricColumn"
               variant="unstyled"
               size="none"
               type="button"
@@ -480,6 +486,13 @@ defineExpose({ scrollToActive, filteredCount: computed(() => filteredSongs.value
             >
               {{ entry.data.album || '未知专辑' }}
             </Button>
+
+            <div
+              v-if="showLyricColumn && showAlbum"
+              class="min-w-0 hidden md:block pr-3 text-[12px] text-left text-text-main/45 truncate"
+            >
+              {{ entry.data.lyricSnippet || '' }}
+            </div>
 
             <div
               v-if="showDuration"

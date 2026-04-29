@@ -41,6 +41,7 @@ const isDragging = ref(false);
 const dragStartY = ref(0);
 const dragStartScrollTop = ref(0);
 const isHovering = ref(false);
+const isMouseInArea = ref(false);
 const autoHideTimer = ref<number | null>(null);
 let measureFrame = 0;
 let resizeObserver: ResizeObserver | null = null;
@@ -200,11 +201,11 @@ const clearAutoHideTimer = () => {
 const scheduleAutoHide = () => {
   clearAutoHideTimer();
   autoHideTimer.value = window.setTimeout(() => {
-    if (!isDragging.value) {
+    if (!isDragging.value && !isMouseInArea.value) {
       isHovering.value = false;
     }
     autoHideTimer.value = null;
-  }, 1000);
+  }, 1500);
 };
 
 const handleScroll = (event: Event) => {
@@ -218,15 +219,16 @@ const handleScroll = (event: Event) => {
 
 const handleScrollAreaMouseEnter = () => {
   updateScrollMetrics();
+  isMouseInArea.value = true;
   isHovering.value = true;
   clearAutoHideTimer();
 };
 
 const handleScrollAreaMouseLeave = () => {
+  isMouseInArea.value = false;
   if (!isDragging.value) {
-    isHovering.value = false;
+    scheduleAutoHide();
   }
-  clearAutoHideTimer();
 };
 
 const handleThumbMouseDown = (e: MouseEvent) => {
@@ -266,7 +268,7 @@ const handleScrollbarMouseEnter = () => {
 
 const handleScrollbarMouseLeave = () => {
   if (!isDragging.value) {
-    isHovering.value = false;
+    scheduleAutoHide();
   }
 };
 
@@ -419,7 +421,7 @@ watch(
   position: absolute;
   top: 0;
   right: 0;
-  width: 8px;
+  width: 12px;
   height: 100%;
   padding: v-bind('`${effectiveScrollbarInset}px 2px`');
   box-sizing: border-box;
@@ -428,11 +430,14 @@ watch(
 }
 
 .scrollbar-thumb {
-  width: 100%;
+  width: 4px;
+  margin-left: auto;
   background: rgba(0, 0, 0, 0.3);
   border-radius: 4px;
   cursor: pointer;
-  transition: background 0.2s ease;
+  transition:
+    background 0.2s ease,
+    width 0.2s ease;
   will-change: transform;
 }
 
@@ -440,11 +445,14 @@ watch(
   background: rgba(255, 255, 255, 0.3);
 }
 
-.scrollbar-thumb:hover {
+.scrollbar-thumb:hover,
+.scrollbar-thumb:active {
+  width: 8px;
   background: rgba(0, 0, 0, 0.5);
 }
 
-.dark .scrollbar-thumb:hover {
+.dark .scrollbar-thumb:hover,
+.dark .scrollbar-thumb:active {
   background: rgba(255, 255, 255, 0.5);
 }
 

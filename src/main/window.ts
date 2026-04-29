@@ -24,6 +24,7 @@ type AppSettings = {
   theme: ThemeMode;
   rememberWindowSize: boolean;
   preventSleep: boolean;
+  disableGpuAcceleration: boolean;
   windowState: WindowState;
 };
 
@@ -34,6 +35,7 @@ const settingsStore = new Conf<AppSettings>({
     theme: 'system',
     rememberWindowSize: true,
     preventSleep: true,
+    disableGpuAcceleration: false,
     windowState: {
       width: 1100,
       height: 750,
@@ -262,6 +264,7 @@ export async function createWindow() {
       webSecurity: false, // 禁用 CORS 限制
       allowRunningInsecureContent: true, // 允许混合内容
       zoomFactor: 1.0,
+      backgroundThrottling: false, // 最小化后不节流，保证播放状态和歌词同步
     },
   });
 

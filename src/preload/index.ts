@@ -9,6 +9,7 @@ import type {
   DesktopLyricSnapshot,
   DesktopLyricSnapshotPatch,
 } from '../shared/desktop-lyric';
+import type { RecognizeResponse } from '../shared/shazam';
 
 const ipcListenerMap = new Map<
   string,
@@ -56,11 +57,14 @@ contextBridge.exposeInMainWorld('electron', {
       return () => ipcRenderer.removeListener('shortcut-trigger', listener);
     },
   },
-  windowControl: (action: 'minimize' | 'maximize' | 'close') =>
+  windowControl: (action: 'minimize' | 'maximize' | 'close' | 'fullscreen') =>
     ipcRenderer.send('window-control', action),
   appInfo: {
     get: () => ipcRenderer.invoke('app:get-info') as Promise<AppInfoResult>,
     getChangelog: () => ipcRenderer.invoke('app:get-changelog') as Promise<string>,
+  },
+  fonts: {
+    getAll: () => ipcRenderer.invoke('get-all-fonts') as Promise<string[]>,
   },
   updater: {
     download: () => ipcRenderer.send('update:download'),
@@ -84,6 +88,7 @@ contextBridge.exposeInMainWorld('electron', {
       data?: any;
       headers?: Record<string, string>;
     }) => ipcRenderer.invoke('api:request', config),
+    clearCache: () => ipcRenderer.invoke('api:cache-clear'),
   },
   tray: {
     syncPlayback: (payload: { isPlaying?: boolean; playMode?: PlayMode; volume?: number }) =>
@@ -121,4 +126,92 @@ contextBridge.exposeInMainWorld('electron', {
     ) => ipcRenderer.send('desktop-lyric:command', command),
   },
   log: log.functions,
+  mpv: {
+    load: (url: string) => ipcRenderer.invoke('mpv:load', url),
+    loadMkvTrack: (url: string, trackId: number) =>
+      ipcRenderer.invoke('mpv:load-mkv-track', url, trackId),
+    getTrackList: () => ipcRenderer.invoke('mpv:get-track-list'),
+    play: () => ipcRenderer.invoke('mpv:play'),
+    pause: () => ipcRenderer.invoke('mpv:pause'),
+    stop: () => ipcRenderer.invoke('mpv:stop'),
+    seek: (time: number) => ipcRenderer.invoke('mpv:seek', time),
+    setVolume: (volume: number) => ipcRenderer.invoke('mpv:set-volume', volume),
+    setSpeed: (speed: number) => ipcRenderer.invoke('mpv:set-speed', speed),
+    setAudioDevice: (deviceName: string) => ipcRenderer.invoke('mpv:set-audio-device', deviceName),
+    getAudioDevices: () =>
+      ipcRenderer.invoke('mpv:get-audio-devices') as Promise<
+        Array<{ name: string; description: string }>
+      >,
+    setNormalizationGain: (gainDb: number) =>
+      ipcRenderer.invoke('mpv:set-normalization-gain', gainDb),
+    fade: (from: number, to: number, durationMs: number) =>
+      ipcRenderer.invoke('mpv:fade', from, to, durationMs),
+    cancelFade: () => ipcRenderer.invoke('mpv:cancel-fade'),
+    pauseWithFade: (savedVolume: number, durationMs: number) =>
+      ipcRenderer.invoke('mpv:pause-with-fade', savedVolume, durationMs),
+    playWithFade: (targetVolume: number, durationMs: number) =>
+      ipcRenderer.invoke('mpv:play-with-fade', targetVolume, durationMs),
+    getState: () => ipcRenderer.invoke('mpv:get-state'),
+    available: () => ipcRenderer.invoke('mpv:available') as Promise<boolean>,
+    restart: () => ipcRenderer.invoke('mpv:restart') as Promise<boolean>,
+    setExclusive: (exclusive: boolean) => ipcRenderer.invoke('mpv:set-exclusive', exclusive),
+    setMediaTitle: (title: string) => ipcRenderer.invoke('mpv:set-media-title', title),
+    setLoopFile: (loop: boolean) => ipcRenderer.invoke('mpv:set-loop-file', loop),
+    onTimeUpdate: (func: (time: number) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, time: number) => func(time);
+      ipcRenderer.on('mpv:time-update', listener);
+      return () => ipcRenderer.removeListener('mpv:time-update', listener);
+    },
+    onDurationChange: (func: (duration: number) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, duration: number) => func(duration);
+      ipcRenderer.on('mpv:duration-change', listener);
+      return () => ipcRenderer.removeListener('mpv:duration-change', listener);
+    },
+    onStateChange: (func: (state: { playing?: boolean; paused?: boolean }) => void) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        state: { playing?: boolean; paused?: boolean },
+      ) => func(state);
+      ipcRenderer.on('mpv:state-change', listener);
+      return () => ipcRenderer.removeListener('mpv:state-change', listener);
+    },
+    onPlaybackEnd: (func: (reason: string) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, reason: string) => func(reason);
+      ipcRenderer.on('mpv:playback-end', listener);
+      return () => ipcRenderer.removeListener('mpv:playback-end', listener);
+    },
+    onError: (func: (message: string) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, message: string) => func(message);
+      ipcRenderer.on('mpv:error', listener);
+      return () => ipcRenderer.removeListener('mpv:error', listener);
+    },
+  },
+  shazam: {
+    recognize: (pcmData: ArrayBuffer) =>
+      ipcRenderer.invoke('shazam:recognize', pcmData) as Promise<RecognizeResponse>,
+    enableLoopback: () => ipcRenderer.invoke('enable-loopback-audio'),
+    disableLoopback: () => ipcRenderer.invoke('disable-loopback-audio'),
+  },
+  mediaControls: {
+    updateMetadata: (payload: {
+      title: string;
+      artist: string;
+      album: string;
+      coverUrl?: string;
+      durationMs?: number;
+    }) => ipcRenderer.invoke('media-control:update-metadata', payload),
+    updateState: (payload: { status: string }) =>
+      ipcRenderer.invoke('media-control:update-state', payload),
+    updateTimeline: (payload: { currentTimeMs: number; totalTimeMs: number }) =>
+      ipcRenderer.invoke('media-control:update-timeline', payload),
+    available: () => ipcRenderer.invoke('media-control:available') as Promise<boolean>,
+    onEvent: (func: (event: { type: string; positionMs?: number }) => void) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        data: { type: string; positionMs?: number },
+      ) => func(data);
+      ipcRenderer.on('media-control:event', listener);
+      return () => ipcRenderer.removeListener('media-control:event', listener);
+    },
+  },
 });

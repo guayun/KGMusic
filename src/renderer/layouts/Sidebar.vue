@@ -70,7 +70,7 @@ const menuGroups = [
   {
     title: '我的乐库',
     items: [
-      { name: '我最喜爱', path: '/main/liked', icon: 'heart', action: 'liked-playlist' },
+      { name: '我最喜爱', path: '/main/favorites', icon: 'heart' },
       { name: '私人 FM', path: '/main/personal-fm', icon: 'pulse' },
       { name: '我的云盘', path: '/main/cloud', icon: 'cloud' },
       { name: '播放历史', path: '/main/history', icon: 'clock' },
@@ -123,7 +123,7 @@ const canRemovePlaylist = (playlist: PlaylistMeta): boolean => !isDefaultPlaylis
 
 const createdPlaylists = computed(() =>
   playlistStore.userPlaylists.filter(
-    (playlist) => playlist.source !== 2 && !isLikedPlaylist(playlist) && isOwnerPlaylist(playlist),
+    (playlist) => playlist.source !== 2 && isOwnerPlaylist(playlist),
   ),
 );
 
@@ -131,10 +131,6 @@ const favoritedPlaylists = computed(() =>
   playlistStore.userPlaylists.filter(
     (playlist) => playlist.source !== 2 && !isLikedPlaylist(playlist) && !isOwnerPlaylist(playlist),
   ),
-);
-
-const favoritedAlbums = computed(() =>
-  playlistStore.userPlaylists.filter((playlist) => playlist.source === 2),
 );
 
 const activePlaylistRouteId = computed(() => {
@@ -159,12 +155,6 @@ const getPlaylistRouteId = (playlist: PlaylistMeta): string => {
   return String(playlist.listCreateGid ?? playlist.globalCollectionId ?? playlist.id);
 };
 
-const likedPlaylistRouteId = computed(() => {
-  const likedPlaylist = playlistStore.likedPlaylist;
-  if (!likedPlaylist) return '';
-  return getPlaylistRouteId(likedPlaylist);
-});
-
 const findPlaylistByRouteId = (routeId: string, source?: number): PlaylistMeta | undefined => {
   if (!routeId) return undefined;
   return playlistStore.userPlaylists.find((playlist) => {
@@ -178,10 +168,10 @@ const isActivePlaylist = (playlist: PlaylistMeta): boolean => {
   return getPlaylistRouteId(playlist) === activePlaylistRouteId.value;
 };
 
-const isActiveAlbum = (playlist: PlaylistMeta): boolean => {
-  if (playlist.source !== 2) return false;
-  return getPlaylistRouteId(playlist) === activeAlbumRouteId.value;
-};
+// const isActiveAlbum = (playlist: PlaylistMeta): boolean => {
+//   if (playlist.source !== 2) return false;
+//   return getPlaylistRouteId(playlist) === activeAlbumRouteId.value;
+// };
 
 const navigateToPlaylist = (playlist: PlaylistMeta) => {
   if (playlist.source === 2) {
@@ -198,34 +188,6 @@ const navigateToPlaylist = (playlist: PlaylistMeta) => {
     params: { id },
     query: { type: isOwnerPlaylist(playlist) ? 'user' : 'special' },
   });
-};
-
-const navigateToLikedPlaylist = async () => {
-  if (!isLoggedIn.value) {
-    try {
-      await router.push('/main/liked');
-    } catch {
-      toastStore.navigateFailed();
-    }
-    return;
-  }
-
-  let likedPlaylist = playlistStore.likedPlaylist;
-  if (!likedPlaylist) {
-    try {
-      await playlistStore.fetchUserPlaylists();
-    } catch {
-      toastStore.loadFailed('歌单');
-    }
-    likedPlaylist = playlistStore.likedPlaylist;
-  }
-
-  if (!likedPlaylist) return;
-
-  // Silently sync favorites to update heart icons globally
-  void playlistStore.fetchLikedPlaylistSongs();
-
-  navigateToPlaylist(likedPlaylist);
 };
 
 const refreshUserPlaylists = async () => {
@@ -361,21 +323,10 @@ const isMenuItemDisabled = (item?: { path: string; action?: string }) => {
 
 const handleMenuClick = (item: { path: string; action?: string }) => {
   if (isMenuItemDisabled(item)) return;
-  if (item.action === 'liked-playlist') {
-    void navigateToLikedPlaylist();
-    return;
-  }
   navigateTo(item.path);
 };
 
 const isMenuItemActive = (item: { path: string; action?: string }) => {
-  if (item.action === 'liked-playlist') {
-    return (
-      route.name === 'liked-songs' ||
-      (route.name === 'playlist-detail' &&
-        activePlaylistRouteId.value === likedPlaylistRouteId.value)
-    );
-  }
   return route.path === item.path;
 };
 
@@ -426,11 +377,11 @@ watch(
     v-bind="attrs"
     class="sidebar h-full flex flex-col bg-bg-sidebar border-r border-border-light select-none transition-all duration-300 relative"
   >
-    <div :class="['w-full shrink-0 relative', isMac ? 'h-16' : 'h-12']">
+    <div :class="['w-full shrink-0 relative', isMac ? 'h-12' : 'h-6']">
       <div class="drag-region"></div>
     </div>
 
-    <div :class="['px-4 pb-3 shrink-0 no-drag', isMac ? 'mt-2' : 'mt-0']">
+    <div :class="['px-4 pb-4 shrink-0 no-drag', isMac ? 'mt-0' : 'mt-0']">
       <div
         class="user-info-card flex items-center overflow-hidden bg-bg-info-card border border-black/[0.08] dark:border-white/10 rounded-[20px] p-1 transition-all duration-200"
       >
@@ -515,7 +466,7 @@ watch(
       </div>
     </div>
 
-    <div class="pl-7.5 pr-3 mb-2 shrink-0 no-drag mt-2 flex items-center gap-1.5">
+    <div class="pl-7.5 pr-3 mb-2 shrink-0 no-drag -mt-1.5 flex items-center gap-1.5">
       <div class="min-w-0 flex flex-1 items-center gap-1">
         <Button
           variant="unstyled"
@@ -542,7 +493,7 @@ watch(
           ]"
           @click="activePlaylistTab = 1"
         >
-          收藏歌单/专辑
+          收藏歌单
         </Button>
       </div>
       <div class="flex items-center gap-0.5 shrink-0 pl-0.5">
@@ -677,51 +628,8 @@ watch(
             </Button>
           </div>
 
-          <div v-if="favoritedAlbums.length > 0" class="sidebar-list-divider"></div>
-
           <div
-            v-for="album in favoritedAlbums"
-            :key="album.listid || album.id"
-            :class="[
-              'sidebar-library-item relative w-full flex items-center gap-3 px-3.5 py-1.5 rounded-[12px] group cursor-pointer active:scale-[0.98] transition-all',
-              isActiveAlbum(album)
-                ? 'is-active bg-primary/[0.12] text-primary'
-                : 'text-text-main/90',
-            ]"
-            @click="navigateToPlaylist(album)"
-          >
-            <Cover
-              :url="album.pic"
-              :size="100"
-              :width="28"
-              :height="28"
-              :borderRadius="6"
-              class="shrink-0"
-            />
-            <div class="sidebar-playlist-label-wrap has-action">
-              <span
-                :class="[
-                  'text-[13px] truncate w-full font-medium tracking-tight',
-                  isActiveAlbum(album) ? 'text-primary' : 'text-text-main/90',
-                ]"
-              >
-                {{ album.name }}
-              </span>
-            </div>
-            <Button
-              variant="unstyled"
-              size="none"
-              type="button"
-              class="sidebar-playlist-action"
-              title="取消收藏"
-              @click.stop="openRemovePlaylistDialog(album)"
-            >
-              <Icon :icon="iconTrash" width="14" height="14" />
-            </Button>
-          </div>
-
-          <div
-            v-if="favoritedPlaylists.length === 0 && favoritedAlbums.length === 0"
+            v-if="favoritedPlaylists.length === 0"
             class="py-8 text-center opacity-40 text-[12px] italic"
           >
             暂无收藏内容
@@ -837,14 +745,6 @@ watch(
 }
 
 .dark .sidebar-user-divider {
-  background-color: color-mix(in srgb, var(--color-text-main) 18%, transparent);
-}
-
-.sidebar-list-divider {
-  @apply my-2.5 mx-3.5 h-[1px] rounded-full bg-text-main/10;
-}
-
-.dark .sidebar-list-divider {
   background-color: color-mix(in srgb, var(--color-text-main) 18%, transparent);
 }
 

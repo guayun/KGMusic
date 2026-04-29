@@ -1,4 +1,5 @@
 <script setup lang="ts">
+defineOptions({ name: 'ranking' });
 import { computed, onMounted, ref, watch } from 'vue';
 import { getRanks, getRankTop, getRankSongs } from '@/api/playlist';
 import SliverHeader from '@/components/music/DetailPageSliverHeader.vue';
@@ -20,6 +21,7 @@ import { iconPlay, iconList, iconChevronDown, iconCurrentLocation, iconSearch } 
 import { replaceQueueAndPlay } from '@/utils/playback';
 import { useToastStore } from '@/stores/toast';
 import Badge from '@/components/ui/Badge.vue';
+
 const playlistStore = usePlaylistStore();
 const playerStore = usePlayerStore();
 const toastStore = useToastStore();
